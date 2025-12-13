@@ -1,0 +1,7 @@
+Metric,Pre-Processed Mean,Post-Processed Mean,Pre-Processed Median,Post-Processed Median,Pre-Processed Std Dev,Post-Processed Std Dev
+Trip Duration (min),15.03,11.51,10.52,9.92,153.39,7.14
+Distance (km),11.33,3.42,2.74,2.57,10.0k,2.72
+Avg Speed (km/h),77.31,18.12,17.22,16.69,134.3k,7.95
+Fare ($),12.34,10.22,9.00,8.50,48.17,5.48
+Price/km ($),3.85,3.67,3.29,3.37,24.79,1.44
+Price/min ($),1.11,0.9931,0.9330,0.9213,14.56,0.3369
