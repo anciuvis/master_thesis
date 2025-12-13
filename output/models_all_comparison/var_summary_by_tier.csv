@@ -1,0 +1,4 @@
+Tier,Zones,Model_Type,Approx_Params,Mean_MAPE
+High-Demand (VAR),10,VAR(7),710,191.22729352034975
+Medium-Demand (AR7),82,AR(7) individual,574,
+Low-Demand (AR3),8,AR(3) individual,24,
