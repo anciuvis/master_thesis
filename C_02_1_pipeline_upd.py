@@ -3,6 +3,7 @@
 # ====================================================================================
 # ====================================================================================
 import os
+import gc
 import warnings
 import json
 import pickle
@@ -432,13 +433,14 @@ class XGBoostOptimizer:
         
         return grid_search.best_params_, grid_search.best_estimator_
     
+
     def fit_all_clusters(self, X_train, y_train, X_val=None, y_val=None):
-        """FIX #8: Fit XGBoost for all clusters with validation set support"""
+        """Fit XGBoost for all clusters with validation set support"""
         logger.info("Fitting XGBoost models for all clusters...")
         progress.update(40, "Fitting XGBoost for all clusters")
         
-        for idx, cluster in enumerate(y_train.columns):
-            logger.info(f"  [{idx+1}/{len(y_train.columns)}] Fitting cluster {cluster}...")
+        for idx, cluster in enumerate(top_clusters):
+            logger.info(f"  [{idx+1}/{len(top_clusters)}] Fitting cluster {cluster}...")
             
             # Get best params or use defaults
             if cluster in self.best_params:
@@ -455,13 +457,10 @@ class XGBoostOptimizer:
             
             model = XGBRegressor(objective='reg:squarederror', random_state=42, **params)
             
-            # FIX #8: Use validation set if available
             if X_val is not None and y_val is not None:
                 model.fit(
                     X_train.values, y_train[cluster].values,
                     eval_set=[(X_val.values, y_val[cluster].values)],
-                    eval_metric='rmse',
-                    early_stopping_rounds=10,
                     verbose=False
                 )
             else:
@@ -470,40 +469,76 @@ class XGBoostOptimizer:
             self.models[cluster] = model
         
         logger.info(f"Fitted {len(self.models)} XGBoost models")
-    
+
     def compute_feature_importance(self, X_train, y_train):
-        """Compute feature importance using SHAP or gain"""
-        logger.info("Computing feature importance...")
-        progress.update(45, "Computing feature importance (SHAP/Gain)")
+        """Compute BOTH SHAP (aggregated across ALL clusters) and gain-based importance"""
+        logger.info("Computing feature importance (SHAP across all clusters + Gain)...")
+        progress.update(45, "Computing feature importance (aggregated)")
         
         self.feature_names = X_train.columns.tolist()
         
-        # Use first cluster as representative
+        # ALWAYS compute gain-based importance (fast, reliable)
+        logger.info("Computing gain-based feature importance...")
         first_cluster = list(self.models.keys())[0]
-        model = self.models[first_cluster]
+        self._compute_gain_importance(self.models[first_cluster])
         
-        # Method 1: SHAP
+        # AGGREGATED SHAP across ALL clusters if available
         if SHAP_AVAILABLE:
             try:
-                logger.info("Using SHAP for feature importance...")
-                explainer = shap.TreeExplainer(model)
-                shap_values = explainer.shap_values(X_train.values)
+                logger.info(f"Computing AGGREGATED SHAP across {len(self.models)} clusters...")
                 
-                feature_importance = pd.DataFrame({
-                    'feature': self.feature_names,
-                    'importance_shap': np.abs(shap_values).mean(axis=0)
-                })
+                all_shap_values = []
+                sample_size = min(1000, len(X_train))  # Sample to save memory/time
                 
-                self.feature_importance['shap'] = feature_importance.sort_values('importance_shap', ascending=False)
+                for idx, (cluster, model) in enumerate(self.models.items()):
+                    if idx % 10 == 0:  # Progress every 10 clusters
+                        logger.info(f"  SHAP progress: {idx}/{len(self.models)} clusters")
+                    
+                    try:
+                        explainer = shap.TreeExplainer(model)
+                        # Use smaller sample for speed
+                        shap_vals = explainer.shap_values(X_train.values[:sample_size])
+                        
+                        if len(shap_vals.shape) == 3:
+                            shap_vals = shap_vals[0]
+                        
+                        all_shap_values.append(np.abs(shap_vals).mean(axis=0))
+                        del explainer, shap_vals
+                        
+                    except Exception as e:
+                        logger.warning(f"SHAP failed for cluster {cluster}: {e}")
+                        continue
                 
-                logger.info(f"Top 10 features (SHAP):\n{self.feature_importance['shap'].head(10)}")
+                if all_shap_values:
+                    # Average across ALL cluster models
+                    avg_shap = np.mean(all_shap_values, axis=0)
+                    
+                    feature_importance_shap = pd.DataFrame({
+                        'feature': self.feature_names,
+                        'importance_shap': avg_shap
+                    }).sort_values('importance_shap', ascending=False)
+                    
+                    self.feature_importance['shap_aggregated'] = feature_importance_shap
+                    
+                    logger.info(f"Top 5 AGGREGATED SHAP features:\n{self.feature_importance['shap_aggregated'].head()}")
+                else:
+                    logger.warning("No SHAP values computed, skipping aggregated SHAP")
+                
+                gc.collect()
                 
             except Exception as e:
-                logger.warning(f"SHAP computation failed: {e}. Using gain instead.")
-                self._compute_gain_importance(model)
+                logger.warning(f"Aggregated SHAP failed: {e}")
         else:
-            self._compute_gain_importance(model)
-    
+            logger.warning("SHAP not available")
+        
+        # Log comparison
+        logger.info("\n=== FEATURE IMPORTANCE COMPARISON ===")
+        if 'gain' in self.feature_importance:
+            logger.info("Top 5 Gain: " + str(self.feature_importance['gain']['feature'].head().tolist()))
+        if 'shap_aggregated' in self.feature_importance:
+            logger.info("Top 5 SHAP (aggregated): " + str(self.feature_importance['shap_aggregated']['feature'].head().tolist()))
+        logger.info("=====================================")
+
     def _compute_gain_importance(self, model):
         """Fallback: compute gain-based importance"""
         logger.info("Using gain-based feature importance...")
@@ -518,7 +553,7 @@ class XGBoostOptimizer:
         self.feature_importance['gain'] = feature_importance
         
         logger.info(f"Top 10 features (Gain):\n{feature_importance.head(10)}")
-    
+
     def predict(self, X):
         """Generate predictions for all clusters"""
         predictions = {}
@@ -534,14 +569,14 @@ class XGBoostOptimizer:
 
 class LSTMPredictor:
     """LSTM encoder-decoder for sequence prediction"""
-    
+
     def __init__(self, n_features: int, n_lags: int = 24):
         self.n_features = n_features
         self.n_lags = n_lags
         self.model = None
         self.scaler = MinMaxScaler()
         self.history = None
-    
+
     def create_sequences(self, data: np.ndarray, seq_length: int = 24):
         """Create sequences for LSTM"""
         X, y = [], []
@@ -549,55 +584,58 @@ class LSTMPredictor:
             X.append(data[i:i+seq_length])
             y.append(data[i+seq_length])
         return np.array(X), np.array(y)
-    
+
     def build_model(self, units: list = [64, 32]):
         """Build encoder-decoder LSTM"""
         logger.info("Building LSTM encoder-decoder model...")
-        
+
         inputs = keras.Input(shape=(self.n_lags, self.n_features))
-        
+
         # Encoder
         encoded = Bidirectional(LSTM(units[0], activation='relu', return_sequences=True))(inputs)
         encoded = Dropout(0.2)(encoded)
         encoded = Bidirectional(LSTM(units[1], activation='relu'))(encoded)
         encoded = Dropout(0.2)(encoded)
-        
+
         # Decoder
         decoded = RepeatVector(1)(encoded)
         decoded = LSTM(units[1], activation='relu', return_sequences=True)(decoded)
         decoded = Dropout(0.2)(decoded)
         decoded = LSTM(units[0], activation='relu', return_sequences=False)(decoded)
         decoded = Dropout(0.2)(decoded)
-        
+
         outputs = Dense(self.n_features)(decoded)
-        
+
         self.model = keras.Model(inputs, outputs)
         self.model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-        
+
         logger.info(f"[OK] LSTM model built: {self.model.count_params()} parameters")
         return self.model
-    
+
     def fit(self, X_train: np.ndarray, epochs: int = 50, batch_size: int = 32):
-        """Fit LSTM model"""
-        logger.info("Fitting LSTM model...")
+        """Fit LSTM encoder-decoder for multi-step forecasting"""
+        logger.info("Fitting LSTM for multi-step forecasting...")
         progress.update(50, "Training LSTM encoder-decoder")
-        
+
         callbacks = [
             EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
             ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001)
         ]
-        
+
+        # X_train shape: (num_sequences, 24, num_features)
+        # Target: predict next step(s) from last timestep
         self.history = self.model.fit(
-            X_train[:, :-1], X_train[:, -1],
+            X_train,  # Keep ALL 24 timesteps (encoder input)
+            X_train[:, -1, :],  # Target: last timestep (decoder output)
             epochs=epochs,
             batch_size=batch_size,
             validation_split=0.2,
             callbacks=callbacks,
             verbose=0
         )
-        
-        logger.info(f"[OK] LSTM model fitted. Final loss: {self.history.history['loss'][-1]:.4f}")
-    
+
+        logger.info(f"[OK] LSTM encoder-decoder fitted. Final loss: {self.history.history['loss'][-1]:.4f}")
+
     def predict(self, X):
         """Generate predictions"""
         return self.model.predict(X, verbose=0)
@@ -623,6 +661,7 @@ else:
 
 
 if not checkpoint_mgr.is_complete('data_prepared'):
+    gc.collect()
     demand_matrix = prepare_demand_matrix(data, freq='H')
     demand_with_features = add_temporal_features(demand_matrix)
     train_data, val_data, test_data = create_train_val_test_split(demand_with_features)
@@ -643,6 +682,7 @@ else:
 
 
 if not checkpoint_mgr.is_complete('features_engineered'):
+    gc.collect()
     print("\n" + "="*80)
     print("STEP 2: FEATURE ENGINEERING")
     print("="*80)
@@ -655,7 +695,7 @@ if not checkpoint_mgr.is_complete('features_engineered'):
     test_features = test_features_all.iloc[len(train_data):]
     
     # Select top demand clusters for modeling
-    top_n_clusters = 10
+    top_n_clusters = 30
     top_clusters = demand_matrix.sum().nlargest(top_n_clusters).index.tolist()
     
     logger.info(f"\nCluster demand distribution (top 15):")
@@ -730,6 +770,8 @@ if not checkpoint_mgr.is_complete('sarima_fitted'):
     checkpoint_mgr.save_checkpoint('sarima_models', sarima_models)
     checkpoint_mgr.save_checkpoint('fitted_sarima', fitted_sarima)
     checkpoint_mgr.mark_complete('sarima_fitted')
+    del train_data  # Release large time series
+    gc.collect()
 else:
     print("[OK] SARIMA models already fitted (from checkpoint)")
     sarima_models = checkpoint_mgr.load_checkpoint('sarima_models')
@@ -745,13 +787,16 @@ if not checkpoint_mgr.is_complete('xgboost_fitted'):
     xgb_optimizer = XGBoostOptimizer(n_lags=24)
     
     # Hyperparameter tuning for first cluster
-    logger.info("Starting XGBoost hyperparameter optimization...")
-    xgb_optimizer.tune_hyperparameters(X_train, y_train, X_val, y_val,
-                                       target_cluster=top_clusters[0], 
-                                       grid_type='quick')
+    #logger.info("Starting XGBoost hyperparameter optimization...")
+    #xgb_optimizer.tune_hyperparameters(X_train, y_train, X_val, y_val,
+    #                                   target_cluster=top_clusters[0], 
+    #                                   grid_type='quick')
     
     # Fit with validation set
     xgb_optimizer.fit_all_clusters(X_train, y_train, X_val, y_val)
+
+    checkpoint_mgr.save_checkpoint('xgb_optimizer', xgb_optimizer)
+    logger.info(f"[OK] Fitted {len(xgb_optimizer.models)} XGBoost models - checkpoint saved")
     
     # Compute feature importance
     xgb_optimizer.compute_feature_importance(X_train, y_train)
@@ -768,6 +813,23 @@ else:
     xgb_optimizer = checkpoint_mgr.load_checkpoint('xgb_optimizer')
 
 
+# ============================================================================
+# FORCE RECOMPUTE FEATURE IMPORTANCE
+# ============================================================================
+
+print("\n" + "="*80)
+print("RECOMPUTING FEATURE IMPORTANCE")
+print("="*80)
+
+logger.info("Forcing feature importance recomputation...")
+xgb_optimizer.compute_feature_importance(X_train, y_train)
+
+# Save updated feature importance
+if xgb_optimizer.feature_importance:
+    importance_df = list(xgb_optimizer.feature_importance.values())[0]
+    importance_df.to_csv(os.path.join(RESULTS_DIR, 'feature_importance_updated.csv'), index=False)
+    logger.info("[OK] Updated feature importance saved to: feature_importance_updated.csv")
+
 print("\n" + "="*80)
 print("STEP 5: LSTM MODELS")
 print("="*80)
@@ -778,6 +840,7 @@ if not checkpoint_mgr.is_complete('lstm_fitted'):
     
     # Scale data for LSTM
     scaler = MinMaxScaler()
+    gc.collect()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
@@ -852,7 +915,7 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     lstm_predictions_full = scaler.inverse_transform(dummy)
     lstm_predictions = lstm_predictions_full[:, :lstm_pred.shape[1]]
     
-    # FIX #6: Ensure alignment between predictions and actual values
+    # Ensure alignment between predictions and actual values
     common_clusters = list(set(top_clusters) & set(y_test.columns) & set(xgb_predictions.columns))
     logger.info(f"Evaluating {len(common_clusters)} common clusters")
     
@@ -897,6 +960,8 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     checkpoint_mgr.save_checkpoint('sarima_predictions', sarima_predictions)
     checkpoint_mgr.save_checkpoint('lstm_predictions', lstm_predictions)
     checkpoint_mgr.mark_complete('models_evaluated')
+    del sarima_models
+    gc.collect()
 else:
     print("[OK] Models already evaluated (from checkpoint)")
     metrics_results = checkpoint_mgr.load_checkpoint('metrics_results')
@@ -963,7 +1028,7 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
         plt.savefig(os.path.join(VIZ_DIR, 'forecast_comparison.png'), dpi=300, bbox_inches='tight')
         plt.close()
         logger.info("[OK] Forecast comparison plot saved")
-    
+    gc.collect()
     checkpoint_mgr.mark_complete('visualizations_created')
 
 
@@ -987,9 +1052,15 @@ if metrics_results:
 
 # Save feature importance
 if xgb_optimizer.feature_importance:
-    importance_df = list(xgb_optimizer.feature_importance.values())[0]
-    importance_df.to_csv(os.path.join(RESULTS_DIR, 'feature_importance.csv'), index=False)
-    logger.info("[OK] Feature importance saved to: feature_importance.csv")
+    if 'gain' in xgb_optimizer.feature_importance:
+        xgb_optimizer.feature_importance['gain'].to_csv(
+            os.path.join(RESULTS_DIR, 'feature_importance_gain.csv'), index=False)
+        logger.info("[OK] Gain importance saved")
+    
+    if 'shap_aggregated' in xgb_optimizer.feature_importance:
+        xgb_optimizer.feature_importance['shap_aggregated'].to_csv(
+            os.path.join(RESULTS_DIR, 'feature_importance_shap_aggregated.csv'), index=False)
+        logger.info("[OK] SHAP aggregated importance saved")
 
 
 # Save predictions
