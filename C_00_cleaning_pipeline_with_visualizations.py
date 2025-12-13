@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import kagglehub
 from scipy import stats
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -16,6 +17,66 @@ warnings.filterwarnings('ignore')
 sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (16, 10)
 
+# Download dataset
+
+path = kagglehub.dataset_download("elemento/nyc-yellow-taxi-trip-data")
+print("Path to dataset files:", path)
+
+# ==================================
+# Parse in chunks to save memory
+# ==================================
+
+dtypes = {
+    'VendorID': 'int8',
+    'passenger_count': 'int8',
+    'trip_distance': 'float32',
+    'pickup_longitude': 'float32',
+    'pickup_latitude': 'float32',
+    'dropoff_longitude': 'float32',
+    'dropoff_latitude': 'float32',
+    'fare_amount': 'float32',
+    'tip_amount': 'float32',
+    'total_amount': 'float32'
+}
+
+parse_dates = ['tpep_pickup_datetime', 'tpep_dropoff_datetime']
+
+csv_files = glob.glob(f"{path}/yellow_tripdata_2015-*.csv") + \
+            glob.glob(f"{path}/yellow_tripdata_2016-*.csv")
+csv_files.sort()
+
+# Define the folder path
+folder_path = 'C:/Users/Anya/master_thesis/tmp'
+
+# Create the folder if it doesn't exist
+os.makedirs(folder_path, exist_ok=True)
+
+# Process in chunks, save to temporary parquet files
+chunk_size = 1_500_000
+temp_files = []
+
+for file_idx, file in enumerate(csv_files):
+    print(f"Processing {file}...")
+
+    for chunk_idx, chunk in enumerate(pd.read_csv(file,
+                                                    dtype=dtypes,
+                                                    parse_dates=parse_dates,
+                                                    chunksize=chunk_size)):
+        # Filter chunk to New York pickup coordinates square only, with valid trip distance and fare amount
+        chunk = chunk[
+            (chunk['pickup_longitude'].between(-74.05, -73.75)) &
+            (chunk['pickup_latitude'].between(40.63, 40.86)) &
+            (chunk['trip_distance'] > 0) &
+            (chunk['fare_amount'] > 0)
+        ]
+
+        if len(chunk) > 0:
+            # Save to temporary parquet file
+            temp_file = f"{folder_path}/chunk_{file_idx}_{chunk_idx}.parquet"
+            chunk.to_parquet(temp_file)
+            temp_files.append(temp_file)
+            print(f"Chunk {chunk_idx}: {len(chunk)} rows saved")
+
 # =============================================================================
 # 0. UTILITY FUNCTIONS
 # =============================================================================
@@ -23,8 +84,6 @@ plt.rcParams['figure.figsize'] = (16, 10)
 def format_number(value):
     """
     Convert numbers to human-readable format (k, m, b, etc.)
-    Examples: 1900000 → 1.9m, 10000 → 10k, 1500 → 1.5k
-    Useful for printing large dataset sizes and row counts.
     """
     if pd.isna(value) or value == 0:
         return "0"
@@ -51,7 +110,7 @@ def load_and_preprocess_data(input_pattern):
     Loads multiple parquet files, concatenates them, and drops unnecessary columns.
     Performs initial filtering of zero-distance/duration trips to prevent division errors.
     """
-    print(f"📂 Searching for files matching: {input_pattern}")
+    print(f" Searching for files matching: {input_pattern}")
     parquet_files = sorted(glob.glob(input_pattern))
 
     if not parquet_files:
@@ -76,26 +135,26 @@ def load_and_preprocess_data(input_pattern):
     # Only drop columns that actually exist in the dataframe
     existing_cols_to_drop = [c for c in columns_to_drop if c in df.columns]
     if existing_cols_to_drop:
-        print(f"🗑️  Dropping columns: {existing_cols_to_drop}")
+        print(f"Dropping columns: {existing_cols_to_drop}")
         df = df.drop(columns=existing_cols_to_drop)
 
     # CRITICAL: Pre-filter zero distances and durations to prevent division by zero later
     initial_rows = len(df)
     if 'trip_distance' in df.columns:
         df = df[df['trip_distance'] > 0]
-        print(f"📉 Removed {format_number(initial_rows - len(df))} rows with trip_distance <= 0")
+        print(f"Removed {format_number(initial_rows - len(df))} rows with trip_distance <= 0")
 
     current_rows = len(df)
     df = df[df['tpep_dropoff_datetime'] > df['tpep_pickup_datetime']]
-    print(f"📉 Removed {format_number(current_rows - len(df))} rows with 0 or negative duration")
+    print(f"Removed {format_number(current_rows - len(df))} rows with 0 or negative duration")
 
     if 'pickup_latitude' in df.columns and 'dropoff_latitude' in df.columns:
          before_coord_filter = len(df)
          df = df[~((df['pickup_latitude'] == df['dropoff_latitude']) & 
                    (df['pickup_longitude'] == df['dropoff_longitude']))]
-         print(f"📉 Removed {format_number(before_coord_filter - len(df))} rows with identical pickup/dropoff coordinates")
+         print(f"Removed {format_number(before_coord_filter - len(df))} rows with identical pickup/dropoff coordinates")
 
-    print(f"✅ Data loaded and preprocessed. Shape: ({format_number(df.shape[0])}, {df.shape[1]})")
+    print(f"Data loaded and preprocessed. Shape: ({format_number(df.shape[0])}, {df.shape[1]})")
     return df
 
 # =============================================================================
@@ -106,7 +165,7 @@ def engineer_features(df, output_path):
     """
     Calculates derived spatiotemporal and pricing features.
     """
-    print("\n📊 Calculating derived features...")
+    print("\nCalculating derived features...")
 
     # Ensure datetime format (using correct column names from TLC dataset)
     df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'])
@@ -117,10 +176,10 @@ def engineer_features(df, output_path):
 
     # Trip distance (in km)
     if 'trip_distance' in df.columns:
-        print("   ℹ️ Using 'trip_distance' column (from meter/GPS) for distance calculation")
+        print("    Using 'trip_distance' column (from meter/GPS) for distance calculation")
         df['trip_distance_km'] = df['trip_distance'] * 1.60934
     else:
-        print("   ⚠️ 'trip_distance' column missing - falling back to Haversine distance (straight line)")
+        print("'trip_distance' column missing - falling back to Haversine distance (straight line)")
         def haversine_distance(lat1, lon1, lat2, lon2):
             R = 6371  # Earth radius in km
             lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
@@ -147,7 +206,7 @@ def engineer_features(df, output_path):
     df['price_per_km'] = df['fare_amount'] / df['trip_distance_km']
     df['price_per_min'] = df['fare_amount'] / df['trip_duration_min']
 
-    print("✅ Derived features created")
+    print("Derived features created")
 
     # Visualization: Feature distributions after engineering (P0-P95 RANGE)
     visualize_feature_distributions(df, output_path, stage="01_After_Feature_Engineering")
@@ -227,12 +286,10 @@ def visualize_feature_distributions(df, output_path, stage="raw"):
 def visualize_boxplot_single_metric(df_before, df_after, output_path, stage_name, 
                                    metric_name, feature_key, title):
     """
-    Creates FOCUSED 2-boxplot figure showing Before vs After for ONE metric only.
+    Creates 2-boxplot figure showing Before vs After for each metric.
 
     Left: Before (orange, full Y-axis range showing all outliers)
     Right: After (green, independent Y-axis - smaller range due to fewer outliers)
-
-    CRITICAL: Each plot has INDEPENDENT Y-axis scaling (not shared).
     """
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     fig.suptitle(title, fontsize=14, fontweight='bold')
@@ -242,7 +299,7 @@ def visualize_boxplot_single_metric(df_before, df_after, output_path, stage_name
     after = df_after[feature_key].replace([np.inf, -np.inf], np.nan).dropna()
 
     if len(before) == 0 or len(after) == 0:
-        print(f"⚠️  No valid data for {feature_key} in {stage_name}")
+        print(f"No valid data for {feature_key} in {stage_name}")
         return
 
     # ================================================================
@@ -260,7 +317,7 @@ def visualize_boxplot_single_metric(df_before, df_after, output_path, stage_name
 
     # ================================================================
     # RIGHT: After boxplot (green)
-    # Y-axis will auto-scale INDEPENDENTLY to cleaner range
+    # Y-axis will auto-scale to cleaner range
     # ================================================================
     bp_after = axes[1].boxplot(after, vert=True, patch_artist=True, widths=0.6)
     bp_after['boxes'][0].set_facecolor('green')
@@ -270,7 +327,6 @@ def visualize_boxplot_single_metric(df_before, df_after, output_path, stage_name
     axes[1].set_ylabel(metric_name, fontweight='bold')
     axes[1].grid(axis='y', alpha=0.3)
     axes[1].set_xticklabels([])
-    # Note: matplotlib automatically scales left and right axes independently!
 
     plt.tight_layout()
     save_figure(fig, output_path, f'{stage_name}_{feature_key}.png')
@@ -390,7 +446,7 @@ def apply_cleaning_filters(df, output_path):
     save_figure(fig, output_path, '00_Raw_Data_boxplots.png')
     plt.close()
 
-    print("\n🧹 Stage 1: Basic validity checks...")
+    print("\nStage 1: Basic validity checks...")
     df_stage1 = df.copy()
 
     cols_to_check = ['tpep_pickup_datetime', 'tpep_dropoff_datetime', 'fare_amount']
@@ -408,7 +464,7 @@ def apply_cleaning_filters(df, output_path):
                                    'Trip Duration (minutes)', 'trip_duration_min',
                                    'Stage 1: Trip Duration Before vs After (Basic Validity Checks)')
 
-    print("\n🧹 Stage 2: Geographic outliers (NYC bounding box)...")
+    print("\nStage 2: Geographic outliers (NYC bounding box)...")
     df_stage2 = df_stage1.copy()
 
     if 'pickup_latitude' in df_stage2.columns:
@@ -431,7 +487,7 @@ def apply_cleaning_filters(df, output_path):
     if 'pickup_latitude' in df_stage2.columns:
         visualize_geographic_distribution(df_stage1, df_stage2, output_path)
 
-    print("\n🧹 Stage 3: Speed-based outliers (1-120 km/h)...")
+    print("\nStage 3: Speed-based outliers (1-120 km/h)...")
     df_stage3 = df_stage2.copy()
 
     speed_mask = (df_stage3['avg_speed_kmh'] >= 1) & (df_stage3['avg_speed_kmh'] <= 120)
@@ -443,7 +499,7 @@ def apply_cleaning_filters(df, output_path):
                                    'Average Speed (km/h)', 'avg_speed_kmh',
                                    'Stage 3: Average Speed Before vs After (Speed Filtering)')
 
-    print("\n🧹 Stage 4: Trip duration outliers (IQR method)...")
+    print("\nStage 4: Trip duration outliers (IQR method)...")
     df_stage4 = df_stage3.copy()
 
     Q1_duration = df_stage4['trip_duration_min'].quantile(0.25)
@@ -460,7 +516,7 @@ def apply_cleaning_filters(df, output_path):
                                    'Trip Duration (minutes)', 'trip_duration_min',
                                    'Stage 4: Trip Duration Before vs After (IQR-based Filtering)')
 
-    print("\n🧹 Stage 5: Distance outliers (IQR method)...")
+    print("\nStage 5: Distance outliers (IQR method)...")
     df_stage5 = df_stage4.copy()
 
     Q1_dist = df_stage5['trip_distance_km'].quantile(0.25)
@@ -476,7 +532,7 @@ def apply_cleaning_filters(df, output_path):
                                    'Trip Distance (km)', 'trip_distance_km',
                                    'Stage 5: Trip Distance Before vs After (IQR-based Filtering)')
 
-    print("\n🧹 Stage 6: Pricing outliers...")
+    print("\nStage 6: Pricing outliers...")
     df_stage6 = df_stage5.copy()
 
     price_per_km_mask = (df_stage6['price_per_km'] >= 0.5) & (df_stage6['price_per_km'] <= 20)
@@ -533,7 +589,7 @@ def save_and_report(df, original_size, output_path, scaler, pre_process_stats):
     retention = 100 * final_size / original_size
 
     print(f"\n" + "=" * 100)
-    print(f"🎉 CLEANING SUMMARY")
+    print(f"CLEANING SUMMARY")
     print("=" * 100)
     print(f"Original size (after loading):  {format_number(original_size)}")
     print(f"Final size (after cleaning):    {format_number(final_size)}")
@@ -548,12 +604,12 @@ def save_and_report(df, original_size, output_path, scaler, pre_process_stats):
     file_name = 'taxi_data_cleaned_full.parquet'
     full_output_path = os.path.join(output_path, file_name)
 
-    print(f"\n💾 Saving to {full_output_path}...")
+    print(f"\nSaving to {full_output_path}...")
     df.to_parquet(full_output_path, compression='snappy', index=False)
 
     stats_file = os.path.join(output_path, 'cleaning_statistics.csv')
     post_process_stats.to_csv(stats_file, index=False)
-    print(f"📊 Statistics saved to: {stats_file}")
+    print(f"Statistics saved to: {stats_file}")
 
     # Save comparison of pre vs post statistics
     comparison_file = os.path.join(output_path, 'statistics_comparison.csv')
@@ -567,7 +623,7 @@ def save_and_report(df, original_size, output_path, scaler, pre_process_stats):
         'Post-Processed Std Dev': post_process_stats['Std Dev'],
     })
     comparison_df.to_csv(comparison_file, index=False)
-    print(f"📊 Comparison saved to: {comparison_file}")
+    print(f"Comparison saved to: {comparison_file}")
 
     report_path = os.path.join(output_path, 'cleaning_report.pkl')
     scaler_path = os.path.join(output_path, 'robust_scaler.pkl')
@@ -583,8 +639,8 @@ def save_and_report(df, original_size, output_path, scaler, pre_process_stats):
     joblib.dump(cleaning_report, report_path)
     joblib.dump(scaler, scaler_path)
 
-    print("✅ All files saved successfully.")
-    print(f"\n📁 Output files in: {output_path}")
+    print("All files saved successfully.")
+    print(f"\nOutput files in: {output_path}")
     print(f"   • taxi_data_cleaned_full.parquet (main dataset)")
     print(f"   • cleaning_report.pkl (cleaning metadata)")
     print(f"   • robust_scaler.pkl (preprocessing scaler)")
@@ -602,7 +658,7 @@ if __name__ == "__main__":
 
     try:
         print("="*100)
-        print("🚀 NYC TAXI DATA CLEANING PIPELINE WITH FOCUSED VISUALIZATIONS")
+        print("NYC TAXI DATA CLEANING PIPELINE WITH FOCUSED VISUALIZATIONS")
         print("="*100)
 
         df_raw = load_and_preprocess_data(INPUT_PATTERN)
@@ -615,7 +671,7 @@ if __name__ == "__main__":
         save_and_report(df_cleaned, original_size, OUTPUT_PATH, scaler, pre_process_stats)
 
         print("\n" + "="*100)
-        print("🎉 PIPELINE COMPLETE - Ready for clustering/analysis phase")
+        print("PIPELINE COMPLETE - Ready for clustering/analysis phase")
         print("="*100)
 
     except Exception as e:

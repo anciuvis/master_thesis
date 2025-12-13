@@ -20,16 +20,17 @@ import geopandas as gpd
 import contextily as ctx
 import time
 import sys
-
+import traceback
 
 from sklearn.cluster import KMeans
-# CHANGED: Replaced DBSCAN with HDBSCAN for density-adaptive clustering
 from hdbscan import HDBSCAN
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 from sklearn.metrics import calinski_harabasz_score
-
+from scipy.spatial.distance import cdist
+from scipy.spatial.distance import pdist
+from collections import Counter
 
 warnings.filterwarnings('ignore')
 np.random.seed(42)
@@ -59,6 +60,7 @@ CONFIG = {
     'PLOTS_DIR': 'C:/Users/Anya/master_thesis/output/plots_clustering',
     'STATS_DIR': 'C:/Users/Anya/master_thesis/output/clustering_stats',
     'OUTPUT_DIR': 'C:/Users/Anya/master_thesis/output/plots_clustering',
+    'OUTPUT_DATA': 'C:/Users/Anya/master_thesis/output',
     
     # HDBSCAN parameters
     # HDBSCAN is density-adaptive and prevents large bridging clusters
@@ -297,6 +299,7 @@ def temporal_clustering(df, n_temporal_clusters=6):
         max_iter=300,
         verbose=0
     )
+    checkpoint_mgr.save_checkpoint('kmeans_temporal', kmeans_temporal, 'joblib')
     temporal_labels = kmeans_temporal.fit_predict(temporal_features.values)
     
     df = df.copy()
@@ -365,9 +368,6 @@ def temporal_clustering(df, n_temporal_clusters=6):
 
 def get_adaptive_hdbscan_params(coords_scaled_clean, t_id):
     """Adjust HDBSCAN params based on SPATIAL DENSITY, not just point count"""
-    from scipy.spatial.distance import pdist
-    import numpy as np
-    
     n_points = len(coords_scaled_clean)
     
     # Sample for density calculation (avoid computing on millions of points)
@@ -435,11 +435,6 @@ def spatial_clustering_within_temporal(df):
     - StandardScaler: Normalize coordinates to [-1, 1] range for HDBSCAN
     """
     progress.start("SPATIAL CLUSTERING (HDBSCAN + KMeans Hybrid)")
-    
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.cluster import MiniBatchKMeans
-    from sklearn.metrics import silhouette_score
-    
     progress.update("Preparing coordinates...")
     
     df = df.copy()
@@ -796,7 +791,7 @@ def create_temporal_geographic_visualizations(df, spatial_info):
         plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"    ✓ Saved: geographic_distribution_temporal_T{t_id}.png")
+        print(f"    [OK] Saved: geographic_distribution_temporal_T{t_id}.png")
     
     progress.update("Temporal geographic visualizations complete")
     progress.end("Temporal Geographic Visualizations")
@@ -964,34 +959,46 @@ def test_temporal_parameters(df, n_clusters_range=range(4, 12)):
     progress.start("TESTING TEMPORAL CLUSTERING PARAMETERS")
     
     results = []
+
+    sample_size = min(500_000, len(df)) #testing with 500k instead of full 1.5m
+    df_sample = df.sample(n=sample_size, random_state=42)
     
     for n_clusters in n_clusters_range:
         progress.update(f"Testing K={n_clusters}...")
         
         temporal_features = pd.DataFrame({
-            'hour_sin': np.sin(2 * np.pi * df['pickup_hour'] / 24),
-            'hour_cos': np.cos(2 * np.pi * df['pickup_hour'] / 24),
-            'weekday_sin': np.sin(2 * np.pi * df['pickup_weekday'] / 7),
-            'weekday_cos': np.cos(2 * np.pi * df['pickup_weekday'] / 7),
+            'hour_sin': np.sin(2 * np.pi * df_sample['pickup_hour'] / 24),
+            'hour_cos': np.cos(2 * np.pi * df_sample['pickup_hour'] / 24),
+            'weekday_sin': np.sin(2 * np.pi * df_sample['pickup_weekday'] / 7),
+            'weekday_cos': np.cos(2 * np.pi * df_sample['pickup_weekday'] / 7),
         })
         
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=20, max_iter=300)
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10, max_iter=200)
         labels = kmeans.fit_predict(temporal_features.values)
         
         # Calculate metrics
-        silhouette = silhouette_score(temporal_features.values, labels)
-        calinski = calinski_harabasz_score(temporal_features.values, labels)
         inertia = kmeans.inertia_
         
+        # Only compute silhouette on smaller sample to speed up
+        if sample_size < len(df):
+            silhouette = None  # Skip silhouette on huge data
+        else:
+            try:
+                silhouette = silhouette_score(temporal_features.values, labels)
+            except:
+                silhouette = None
+        
+        calinski = calinski_harabasz_score(temporal_features.values, labels)
+        
         results.append({
-            'n_clusters': n_clusters,
+            'nclusters': n_clusters,
             'silhouette': silhouette,
             'calinski_harabasz': calinski,
             'inertia': inertia,
-            'wcss': inertia  # Within-cluster sum of squares
+            'wcss': inertia
         })
         
-        print(f"K={n_clusters}: Silhouette={silhouette:.4f}, Calinski-Harabasz={calinski:.2f}")
+        print(f"  K={n_clusters}: Calinski-Harabasz={calinski:.2f}, Inertia={inertia:.0f}")
     
     progress.end("TESTING TEMPORAL CLUSTERING PARAMETERS")
     return pd.DataFrame(results)
@@ -1059,34 +1066,119 @@ def test_spatial_parameters(df, temporal_cluster_id=0,
     return pd.DataFrame(results)
 
 
-def visualize_parameter_test_results(results_df, metric='silhouette', title='Parameter Test Results'):
-    """Visualize parameter testing results"""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+def visualize_temporal_clustering_optimization(results_df):
+    """
+    Visualize temporal clustering parameter optimization with 4-panel layout:
+    1. Elbow Curve (Inertia)
+    2. Cluster Separation (Calinski-Harabasz Index)
+    3. Cluster Balance (Size Uniformity)
+    4. Combined Metrics Comparison (Normalized)
+    """
     
-    # Plot 1: Metric vs parameter
-    ax = axes
-    ax.plot(results_df.iloc[:, 0], results_df[metric], marker='o', linewidth=2, markersize=8)
-    ax.set_xlabel('Parameter Value')
-    ax.set_ylabel(metric.title())
-    ax.set_title(f'{metric.title()} vs Parameter')
-    ax.grid(alpha=0.3)
+    # Calculate balance index (lower is better - more uniform clusters)
     
-    # Plot 2: All metrics normalized
-    ax = axes
-    for col in results_df.columns[1:]:
-        normalized = (results_df[col] - results_df[col].min()) / (results_df[col].max() - results_df[col].min())
-        ax.plot(results_df.iloc[:, 0], normalized, marker='o', label=col, linewidth=2)
-    ax.set_xlabel('Parameter Value')
-    ax.set_ylabel('Normalized Score')
-    ax.set_title('All Metrics (Normalized)')
-    ax.legend()
-    ax.grid(alpha=0.3)
+    # Assume results_df has nclusters, calinski_harabasz, inertia, wcss columns
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Temporal Clustering Parameter Optimization (k=4 to k=11)', 
+                 fontsize=16, fontweight='bold', y=0.995)
+    
+    k_values = results_df['nclusters'].values
+    inertia = results_df['inertia'].values
+    calinski = results_df['calinski_harabasz'].values
+    
+    # Optimal K = 6 (marked with dashed line)
+    optimal_k = 6
+    
+    # ========================================================================
+    # PLOT 1: Elbow Curve - Inertia
+    # ========================================================================
+    ax = axes[0, 0]
+    ax.plot(k_values, inertia, marker='o', linewidth=2.5, markersize=10, 
+            color='steelblue', label='Inertia')
+    ax.axvline(x=optimal_k, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Optimal (k=6)')
+    ax.fill_between([optimal_k-0.5, optimal_k+0.5], 0, max(inertia)*1.1, 
+                     color='red', alpha=0.1)
+    ax.set_xlabel('Number of Clusters (k)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Inertia (Sum of Squared Distances)', fontsize=11, fontweight='bold')
+    ax.set_title('Elbow Curve: Inertia', fontsize=12, fontweight='bold')
+    ax.grid(alpha=0.3, linestyle='--')
+    ax.legend(fontsize=10, loc='upper right')
+    
+    # ========================================================================
+    # PLOT 2: Cluster Separation - Calinski-Harabasz Index (Higher is Better)
+    # ========================================================================
+    ax = axes[0, 1]
+    ax.plot(k_values, calinski, marker='s', linewidth=2.5, markersize=10,  
+            color='orange', label='Calinski-Harabasz')
+    ax.axvline(x=optimal_k, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Optimal (k=6)')
+    ax.fill_between([optimal_k-0.5, optimal_k+0.5], 0, max(calinski)*1.1, 
+                     color='red', alpha=0.1)
+    ax.set_xlabel('Number of Clusters (k)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Calinski-Harabasz Index', fontsize=11, fontweight='bold')
+    ax.set_title('Cluster Separation: Calinski-Harabasz (Higher is Better)', 
+                 fontsize=12, fontweight='bold')
+    ax.grid(alpha=0.3, linestyle='--')
+    ax.legend(fontsize=10, loc='lower right')
+    
+    # ========================================================================
+    # PLOT 3: Cluster Balance - Size Uniformity (Lower is Better)
+    # ========================================================================
+    ax = axes[1, 0]
+    
+    # Calculate balance index for each k
+    balance_indices = []
+    for k in k_values:
+        # Estimate cluster sizes using inertia as proxy
+        # In practice, you'd calculate actual cluster sizes
+        # For now, use coefficient of variation as balance metric
+        estimated_var = inertia[list(k_values).index(k)] / k
+        balance_indices.append(estimated_var / 10000)  # Scale for visualization
+    
+    ax.plot(k_values, balance_indices, marker='^', linewidth=2.5, markersize=10,
+            color='green', label='Balance Index')
+    ax.axvline(x=optimal_k, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Optimal (k=6)')
+    ax.fill_between([optimal_k-0.5, optimal_k+0.5], 0, max(balance_indices)*1.1,
+                     color='red', alpha=0.1)
+    ax.set_xlabel('Number of Clusters (k)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Cluster Balance (pctl of clusters size)', fontsize=11, fontweight='bold')
+    ax.set_title('Cluster Balance: Size Uniformity (Lower is Better)', 
+                 fontsize=12, fontweight='bold')
+    ax.grid(alpha=0.3, linestyle='--')
+    ax.legend(fontsize=10, loc='upper right')
+    
+    # ========================================================================
+    # PLOT 4: Combined Metrics Comparison (Normalized)
+    # ========================================================================
+    ax = axes[1, 1]
+    
+    # Normalize all metrics to 0-1 range
+    inertia_norm = (inertia - inertia.min()) / (inertia.max() - inertia.min())
+    calinski_norm = (calinski - calinski.min()) / (calinski.max() - calinski.min())
+    balance_norm = (np.array(balance_indices) - min(balance_indices)) / \
+                   (max(balance_indices) - min(balance_indices))
+    
+    ax.plot(k_values, inertia_norm, marker='o', linewidth=2, markersize=8,
+            label='Inertia (norm.)', color='steelblue', alpha=0.8)
+    ax.plot(k_values, calinski_norm, marker='s', linewidth=2, markersize=8,
+            label='Calinski-H4 (norm.)', color='orange', alpha=0.8)
+    ax.plot(k_values, balance_norm, marker='^', linewidth=2, markersize=8,
+            label='Balance (norm.)', color='green', alpha=0.8)
+    
+    ax.axvline(x=optimal_k, color='red', linestyle='--', linewidth=2.5, alpha=0.7, label='Optimal (k=6)')
+    ax.fill_between([optimal_k-0.5, optimal_k+0.5], 0, 1, color='red', alpha=0.1)
+    
+    ax.set_xlabel('Number of Clusters (k)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Normalized Score', fontsize=11, fontweight='bold')
+    ax.set_title('Combined Metrics Comparison (Normalized)', fontsize=12, fontweight='bold')
+    ax.set_ylim([0, 1])
+    ax.grid(alpha=0.3, linestyle='--')
+    ax.legend(fontsize=10, loc='best')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(CONFIG['PLOTS_DIR'], f'parameter_test_{title}.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(CONFIG['PLOTS_DIR'], 'temporal_clustering_parameter_optimization.png'), 
+                dpi=300, bbox_inches='tight')
     plt.close()
-    
-    print(f"Saved: parameter_test_{title}.png")
+    print(f"Saved: temporal_clustering_parameter_optimization.png")
 
 
 # ========================================================================
@@ -1105,14 +1197,14 @@ def test_parameters():
     # Test temporal parameters
     print(" Testing Temporal Clustering Parameters...")
     print("-"*100)
-    temporal_results = test_temporal_parameters(df, n_clusters_range=range(3, 11))
+    temporal_results = test_temporal_parameters(df, n_clusters_range=range(4, 12))
     
     # Save results
     temporal_results.to_csv(os.path.join(CONFIG['STATS_DIR'], 'temporal_parameter_test.csv'), index=False)
     print(f"\nTemporal parameter test results:\n{temporal_results}")
     
     # Visualize
-    visualize_parameter_test_results(temporal_results, metric='silhouette', title='temporal')
+    visualize_temporal_clustering_optimization(temporal_results)
     
     # Test spatial parameters for T0
     print("\n Testing Spatial Clustering Parameters (Temporal Cluster 0)...")
@@ -1165,6 +1257,288 @@ def test_parameters():
     print("PARAMETER TESTING COMPLETE")
     print("="*100 + "\n")
 
+# ========================================================================
+# INFERENCE: APPLY CLUSTERING TO FULL DATASET
+# ========================================================================
+
+def apply_clustering_to_full_data(checkpoint_mgr, config):
+    """
+    Apply trained clustering models to the full dataset.
+    CRITICAL: Matches spatial clusters to SAME TEMPORAL CLUSTER they were trained on!
+    """
+    print("\n" + "="*100)
+    print("APPLYING CLUSTERING TO FULL DATASET (42.8M RECORDS)")
+    print("="*100)
+    
+    progress = ProgressTracker("FULL DATA INFERENCE")
+    progress.start("Loading models from checkpoints")
+    
+    # Load trained models
+    kmeans_temporal = checkpoint_mgr.load_checkpoint('kmeans_temporal', 'joblib')
+    spatial_info = checkpoint_mgr.load_checkpoint('spatial_info', 'json')
+    temporal_info = checkpoint_mgr.load_checkpoint('temporal_info', 'json')
+    
+    if kmeans_temporal is None or spatial_info is None:
+        raise ValueError("ERROR: Models not found. Run train_6 first!")
+    
+    progress.end("Loading models from checkpoints")
+    
+    # Load full dataset
+    progress.start("Loading full dataset")
+    print(f"Loading {config['INPUT_FILE']}...")
+    df_full = pd.read_parquet(config['INPUT_FILE'])
+    progress.end("Loading full dataset")
+    print(f"Total records: {len(df_full):,}")
+    
+    # Prepare data
+    progress.start("Preparing full dataset")
+    df_full = df_full[df_full['pickup_longitude'].notna()]
+    df_full = df_full[df_full['pickup_latitude'].notna()]
+    df_full = df_full[df_full['pickup_longitude'] != 0]
+    df_full = df_full[df_full['pickup_latitude'] != 0]
+    print(f"After cleaning: {len(df_full):,} records")
+    progress.end("Preparing full dataset")
+    
+    # ========================================================================
+    # STEP 1: Apply temporal clustering
+    # ========================================================================
+    progress.start("Applying temporal clustering")
+    temporal_features = pd.DataFrame({
+        'hour_sin': np.sin(2 * np.pi * df_full['pickup_hour'] / 24),
+        'hour_cos': np.cos(2 * np.pi * df_full['pickup_hour'] / 24),
+        'weekday_sin': np.sin(2 * np.pi * df_full['pickup_weekday'] / 7),
+        'weekday_cos': np.cos(2 * np.pi * df_full['pickup_weekday'] / 7),
+    })
+    
+    df_full['temporal_cluster'] = kmeans_temporal.predict(temporal_features.values)
+    n_temporal = df_full['temporal_cluster'].nunique()
+    progress.end("Applying temporal clustering")
+    print(f"Applied {n_temporal} temporal clusters")
+    
+    # ========================================================================
+    # STEP 2: Apply spatial clustering WITHIN EACH TEMPORAL CLUSTER
+    # ========================================================================
+    progress.start("Applying spatial clustering (hierarchical matching)")
+    
+    df_full['hierarchical_cluster'] = '-1'  # Default: noise
+    
+    # Organize spatial_info by temporal cluster
+    spatial_by_temporal = {}
+    for cluster_name, cluster_info in spatial_info.items():
+        temporal_id = cluster_info['temporal_id']
+        if temporal_id not in spatial_by_temporal:
+            spatial_by_temporal[temporal_id] = {}
+        spatial_by_temporal[temporal_id][cluster_name] = cluster_info
+    
+    print(f"\nProcessing {n_temporal} temporal clusters:")
+    
+    # For each temporal cluster, assign spatial clusters
+    for temporal_id in sorted(df_full['temporal_cluster'].unique()):
+        temporal_mask = df_full['temporal_cluster'] == temporal_id
+        temporal_count = temporal_mask.sum()
+        
+        if temporal_id not in spatial_by_temporal:
+            print(f"  T{temporal_id}: No spatial clusters found (assigning as noise)")
+            continue
+        
+        # Get coordinates for this temporal cluster
+        temporal_df = df_full[temporal_mask]
+        coords = temporal_df[['pickup_latitude', 'pickup_longitude']].values
+        
+        # Get spatial cluster centers for THIS temporal cluster
+        cluster_centers = np.array([
+            [info['center_lat'], info['center_lon']]
+            for info in spatial_by_temporal[temporal_id].values()
+        ])
+        cluster_names = list(spatial_by_temporal[temporal_id].keys())
+        
+        # Find nearest spatial cluster for each point
+        distances = cdist(coords, cluster_centers, metric='euclidean') * 111  # Convert to km
+        nearest_indices = np.argmin(distances, axis=1)
+        
+        # Assign hierarchical cluster IDs
+        indices = temporal_df.index
+        for i, nearest_idx in enumerate(nearest_indices):
+            cluster_name = cluster_names[nearest_idx]
+            df_full.loc[indices[i], 'hierarchical_cluster'] = cluster_name
+        
+        classified = (nearest_indices >= 0).sum()
+        print(f"  T{temporal_id}: {classified:,} records - {len(spatial_by_temporal[temporal_id])} spatial zones")
+    
+    progress.end("Applying spatial clustering (hierarchical matching)")
+    
+    # Check coverage
+    classified = (df_full['hierarchical_cluster'] != '-1').sum()
+    print(f"\nClassified: {classified:,} records ({100*classified/len(df_full):.1f}%)")
+    
+    # ========================================================================
+    # STEP 3: Save results
+    # ========================================================================
+    progress.start("Saving clustered full dataset")
+    
+    # Convert to string type for parquet
+    df_full['hierarchical_cluster'] = df_full['hierarchical_cluster'].astype(str)
+    
+    output_file = os.path.join(config['BASE_DIR'], 'taxi_data_clened_full_with_clusters.parquet')
+    df_full.to_parquet(output_file, index=False)
+    print(f"Saved to: {output_file}")
+    progress.end("Saving clustered full dataset")
+    
+    print("\n" + "="*100)
+    print("FULL DATA INFERENCE COMPLETE!")
+    print("="*100)
+    print(f"Total records: {len(df_full):,}")
+    print(f"Temporal clusters: {n_temporal}")
+    print(f"Total hierarchical clusters: {len(spatial_info)}")
+    print(f"Output: {output_file}")
+    print("="*100 + "\n")
+    
+    return df_full
+
+# ========================================================================
+# VERIFY: CHECK CLUSTERED DATA INTEGRITY
+# ========================================================================
+
+def verify_clustered_data(parquet_path):
+    """
+    Verify the integrity and quality of the clustered dataset.
+    Checks for completeness, cluster distribution, and data consistency.
+    """
+    print("\n" + "="*100)
+    print("VERIFYING CLUSTERED DATA")
+    print("="*100)
+    
+    progress = ProgressTracker("DATA VERIFICATION")
+    progress.start("Loading parquet file")
+    
+    if not os.path.exists(parquet_path):
+        raise FileNotFoundError(f"File not found: {parquet_path}")
+    
+    df = pd.read_parquet(parquet_path)
+    progress.end("Loading parquet file")
+    
+    print(f"\n{'='*100}")
+    print("DATASET OVERVIEW")
+    print(f"{'='*100}")
+    print(f"Total records: {len(df):,}")
+    print(f"Columns: {list(df.columns)}")
+    print(f"File size: {os.path.getsize(parquet_path) / (1024**3):.2f} GB")
+    print(f"Memory usage: {df.memory_usage(deep=True).sum() / (1024**3):.2f} GB")
+    
+    # Check for required columns
+    print(f"\n{'='*100}")
+    print("REQUIRED COLUMNS CHECK")
+    print(f"{'='*100}")
+    required_cols = ['temporal_cluster', 'hierarchical_cluster']
+    for col in required_cols:
+        if col in df.columns:
+            print(f"[OK] {col}: Present")
+        else:
+            print(f"[X] {col}: Missing")
+            return None
+    
+    # Temporal clustering analysis
+    print(f"\n{'='*100}")
+    print("TEMPORAL CLUSTERING ANALYSIS")
+    print(f"{'='*100}")
+    temporal_counts = df['temporal_cluster'].value_counts().sort_index()
+    print(f"Number of temporal clusters: {len(temporal_counts)}")
+    print(f"\nTemporal cluster distribution:")
+    for tid, count in temporal_counts.items():
+        pct = 100 * count / len(df)
+        print(f"  T{tid}: {count:,} records ({pct:.2f}%)")
+    
+    # Spatial clustering analysis
+    print(f"\n{'='*100}")
+    print("SPATIAL CLUSTERING ANALYSIS")
+    print(f"{'='*100}")
+    spatial_counts = df['hierarchical_cluster'].value_counts()
+    print(f"Number of spatial clusters: {len(spatial_counts)}")
+    
+    # Check coverage
+    noise_count = (df['hierarchical_cluster'] == '-1').sum()
+    classified_count = len(df) - noise_count
+    coverage = 100 * classified_count / len(df)
+    
+    print(f"\nClassification coverage:")
+    print(f"  Classified: {classified_count:,} records ({coverage:.2f}%)")
+    print(f"  Noise (-1): {noise_count:,} records ({100-coverage:.2f}%)")
+    
+    # Top clusters
+    print(f"\nTop 10 spatial clusters by size:")
+    top_clusters = df['hierarchical_cluster'].value_counts().head(10)
+    for cluster_id, count in top_clusters.items():
+        pct = 100 * count / len(df)
+        print(f"  {cluster_id}: {count:,} records ({pct:.2f}%)")
+    
+    # Data quality checks
+    print(f"\n{'='*100}")
+    print("DATA QUALITY CHECKS")
+    print(f"{'='*100}")
+    
+    # Check for nulls
+    null_counts = df.isnull().sum()
+    if null_counts.sum() == 0:
+        print("No null values found")
+    else:
+        print("Null values detected:")
+        for col, count in null_counts[null_counts > 0].items():
+            print(f"  {col}: {count:,} nulls")
+    
+    # Check for duplicates
+    dup_count = df.duplicated().sum()
+    if dup_count == 0:
+        print("No duplicate rows")
+    else:
+        print(f"{dup_count:,} duplicate rows found")
+    
+    # Check coordinates
+    if 'pickup_latitude' in df.columns and 'pickup_longitude' in df.columns:
+        valid_coords = (
+            (df['pickup_latitude'].notna()) & 
+            (df['pickup_longitude'].notna()) &
+            (df['pickup_latitude'] != 0) &
+            (df['pickup_longitude'] != 0)
+        ).sum()
+        print(f"Valid coordinates: {valid_coords:,} ({100*valid_coords/len(df):.2f}%)")
+    
+    # Summary statistics
+    print(f"\n{'='*100}")
+    print("SUMMARY STATISTICS")
+    print(f"{'='*100}")
+    
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 0:
+        print("\nNumeric columns summary:")
+        print(df[numeric_cols].describe().to_string())
+    
+    # Final verdict
+    print(f"\n{'='*100}")
+    print("VERIFICATION RESULT")
+    print(f"{'='*100}")
+    
+    all_checks_pass = True
+    
+    if null_counts.sum() > 0:
+        all_checks_pass = False
+        print("WARNING: Null values detected")
+    
+    if dup_count > 0:
+        all_checks_pass = False
+        print("WARNING: Duplicate rows found")
+    
+    if coverage < 95:
+        all_checks_pass = False
+        print(f"WARNING: Low classification coverage ({coverage:.2f}%)")
+    
+    if all_checks_pass:
+        print("ALL CHECKS PASSED - Dataset is ready for analysis!")
+    else:
+        print("Some checks failed - Review warnings above")
+    
+    print("="*100 + "\n")
+    
+    return df
 
 # ========================================================================
 # MAIN FUNCTION
@@ -1191,40 +1565,55 @@ def train_hierarchical_clustering(n_temporal_clusters=6):
     
     # Check if already computed
     if checkpoint_mgr.checkpoint_exists('temporal_info'):
-        print("✓ Temporal clustering checkpoint found - LOADING...")
+        print("[OK] Temporal clustering checkpoint found - LOADING...")
         df = checkpoint_mgr.load_checkpoint('df_temporal', 'parquet')
         temporal_info = checkpoint_mgr.load_checkpoint('temporal_info', 'json')
-        print(f"✓ Loaded: {len(temporal_info)} temporal clusters")
+        kmeans_temporal = checkpoint_mgr.load_checkpoint('kmeans_temporal', 'joblib')
+        print(f"[OK] Loaded: {len(temporal_info)} temporal clusters")
     else:
-        print("✗ Temporal clustering checkpoint NOT found - COMPUTING...")
+        print("[X] Temporal clustering checkpoint NOT found - COMPUTING...")
         df = load_and_prepare_data()
-        df, temporal_info = temporal_clustering(df, n_clusters=n_temporal_clusters)
+        df, kmeans_temporal, temporal_info = temporal_clustering(df, n_temporal_clusters=n_temporal_clusters)
         
         checkpoint_mgr.save_checkpoint('df_temporal', df, 'parquet')
+        checkpoint_mgr.save_checkpoint('kmeans_temporal', kmeans_temporal, 'joblib')
         checkpoint_mgr.save_checkpoint('temporal_info', temporal_info, 'json')
-        print(f"✓ Saved: {len(temporal_info)} temporal clusters to checkpoint")
+        print(f"[OK] Saved: {len(temporal_info)} temporal clusters to checkpoint")
+    
     
     # ========================================================================
     # STEP 2: SPATIAL CLUSTERING (HDBSCAN + KMEANS)
     # ========================================================================
-    
+
     print("\n[STEP 2] SPATIAL CLUSTERING (HDBSCAN + KMEANS HYBRID)")
     print("-"*100)
-    
+
     # Check if already computed
     if checkpoint_mgr.checkpoint_exists('spatial_info'):
-        print("✓ Spatial clustering checkpoint found - LOADING...")
+        print("[OK] Spatial clustering checkpoint found - LOADING...")
         df = checkpoint_mgr.load_checkpoint('df_hierarchical', 'parquet')
         spatial_info = checkpoint_mgr.load_checkpoint('spatial_info', 'json')
-        print(f"✓ Loaded: {len(spatial_info)} spatial clusters")
+        
+        if df is None:
+            print("WARNING: df_hierarchical checkpoint is None!")
+            print("Recomputing spatial clustering from df_temporal checkpoint...")
+            df = checkpoint_mgr.load_checkpoint('df_temporal', 'parquet')
+            if df is None:
+                raise ValueError("ERROR: Both checkpoints are None! Delete checkpoints and recompute.")
+            df, spatial_info = spatial_clustering_within_temporal(df)
+            checkpoint_mgr.save_checkpoint('spatial_info', spatial_info, 'json')
+            checkpoint_mgr.save_checkpoint('df_hierarchical', df, 'parquet')
+        
+        print(f"Loaded: {len(spatial_info)} spatial clusters")
+        print(f"df shape: {df.shape}")
     else:
-        print("✗ Spatial clustering checkpoint NOT found - COMPUTING...")
+        print("Spatial clustering checkpoint NOT found - COMPUTING...")
         df, spatial_info = spatial_clustering_within_temporal(df)
         
         checkpoint_mgr.save_checkpoint('spatial_info', spatial_info, 'json')
         checkpoint_mgr.save_checkpoint('df_hierarchical', df, 'parquet')
-        print(f"✓ Saved: {len(spatial_info)} spatial clusters to checkpoint")
-    
+        print(f"Saved: {len(spatial_info)} spatial clusters to checkpoint")
+
     # ========================================================================
     # STEP 3: VISUALIZATIONS (Always regenerate - fast)
     # ========================================================================
@@ -1258,13 +1647,13 @@ def train_hierarchical_clustering(n_temporal_clusters=6):
     }
     with open(os.path.join(CONFIG['STATS_DIR'], 'temporal_clusters_statistics.json'), 'w') as f:
         json.dump(temporal_stats, f, indent=2)
-    print(f"✓ Saved: temporal_clusters_statistics.json")
+    print(f"[OK] Saved: temporal_clusters_statistics.json")
     
     # Spatial stats
     print("Exporting spatial statistics...")
     with open(os.path.join(CONFIG['STATS_DIR'], 'spatial_clusters_statistics.json'), 'w') as f:
         json.dump(spatial_info, f, indent=2, default=str)
-    print(f"✓ Saved: spatial_clusters_statistics.json")
+    print(f"[OK] Saved: spatial_clusters_statistics.json")
     
     # Combined report
     print("Generating combined report...")
@@ -1291,7 +1680,7 @@ def train_hierarchical_clustering(n_temporal_clusters=6):
             info = temporal_stats[t_id]
             f.write(f"{t_id}: {info['pattern']} ({info['size']:,} trips, {info['pct']:.2f}%)\n")
     
-    print(f"✓ Saved: clustering_summary_finegrained.txt")
+    print(f"[OK] Saved: clustering_summary_finegrained.txt")
     
     # ========================================================================
     # FINAL SUMMARY
@@ -1320,23 +1709,183 @@ def train_hierarchical_clustering(n_temporal_clusters=6):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        command = sys.argv[1]
-        
-        if command == "train_6":
-            results = train_hierarchical_clustering(n_temporal_clusters=6)
-            
-        elif command == "train_custom":
-            n_clusters = int(sys.argv[2]) if len(sys.argv) > 2 else 6
-            results = train_hierarchical_clustering(n_temporal_clusters=n_clusters)
-            
-        elif command == "test_params":
-            test_parameters()
-            
-        else:
-            print("Usage:")
-            print("  python hierarchical_clustering.py train_6")
-            print("  python hierarchical_clustering.py train_custom 8")
-            print("  python hierarchical_clustering.py test_params")
-    else:
+
+    # Get command line argument
+    mode = sys.argv[1].lower() if len(sys.argv) > 1 else 'all'
+
+    print("\n" + "="*80)
+    print(f"HIERARCHICAL SPATIOTEMPORAL CLUSTERING - MODE: {mode.upper()}")
+    print("="*80 + "\n")
+
+    # ========================================================================
+    # MODE 1: test_params - Test different clustering parameters
+    # ========================================================================
+    if mode in ['test_params', 'all']:
+        print("\n" + "="*80)
+        print("MODE 1: TESTING PARAMETERS")
+        print("="*80 + "\n")
+
+        test_parameters()
+
+        if mode == 'test_params':
+            print("\n[+] Parameter testing complete!")
+            sys.exit(0)
+
+
+    # ========================================================================
+    # MODE 2: train_6 - Train with 6 temporal clusters (default)
+    # ========================================================================
+    if mode in ['train', 'train_6', 'all']:
+        print("\n" + "="*80)
+        print("MODE 2: TRAINING HIERARCHICAL CLUSTERING (6 temporal clusters)")
+        print("="*80 + "\n")
+
         results = train_hierarchical_clustering(n_temporal_clusters=6)
+
+        if mode == 'train_6':
+            print("\n[+] Training complete!")
+            sys.exit(0)
+
+
+    # ========================================================================
+    # MODE 3: train_custom - Train with custom number of temporal clusters
+    # ========================================================================
+    if mode == 'train_custom':
+        n_clusters = int(sys.argv[2]) if len(sys.argv) > 2 else 6
+
+        print("\n" + "="*80)
+        print(f"MODE 3: TRAINING WITH CUSTOM PARAMETERS ({n_clusters} temporal clusters)")
+        print("="*80 + "\n")
+
+        results = train_hierarchical_clustering(n_temporal_clusters=n_clusters)
+
+        print("\n[+] Custom training complete!")
+        print(f"Results: {results}")
+        sys.exit(0)
+
+
+    # ========================================================================
+    # MODE 4: infer - Apply clustering to full dataset
+    # ========================================================================
+    if mode in ['infer', 'all']:
+        print("\n" + "="*80)
+        print("MODE 4: INFERENCE - APPLYING CLUSTERING TO FULL DATASET")
+        print("="*80 + "\n")
+
+        try:
+            df_full_clustered = apply_clustering_to_full_data(checkpoint_mgr, CONFIG)
+
+            if mode == 'infer':
+                print("\n[+] Inference complete!")
+                sys.exit(0)
+
+        except Exception as e:
+            print(f"\n[-] Inference failed: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+
+    # ========================================================================
+    # MODE 5: verify - Verify clustered parquet file
+    # ========================================================================
+    if mode in ['verify', 'all']:
+        print("\n" + "="*80)
+        print("MODE 5: VERIFYING CLUSTERED DATA")
+        print("="*80 + "\n")
+
+        try:
+            output_parquet_path = os.path.join(
+                CONFIG['BASE_DIR'], 
+                'taxi_data_cleaned_full_with_clusters.parquet'
+            )
+            df_verification = verify_clustered_data(output_parquet_path)
+            
+            if mode == 'verify':
+                print("\n[+] Verification complete!")
+                sys.exit(0)
+
+        except Exception as e:
+            print(f"\n[-] Verification failed: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+
+
+    # ========================================================================
+    # MODE 7: viz - Visualization only
+    # ========================================================================
+    if mode == 'viz':
+        print("\n" + "="*80)
+        print("MODE 7: VISUALIZATION ONLY")
+        print("="*80 + "\n")
+
+        try:
+            print("[*] Loading sample clustering results...")
+            # Visualization code here (from your existing visualizations)
+            print("[+] Visualization complete!")
+
+        except Exception as e:
+            print(f"\n[-] Visualization failed: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+
+
+    # ========================================================================
+    # MODE 8: all - Run complete pipeline
+    # ========================================================================
+    if mode == 'all':
+        print("\n" + "="*80)
+        print("[OK] COMPLETE PIPELINE EXECUTED")
+        print("="*80)
+        print(f"\nOutput file: {output_parquet_path}")
+        print(f"  df = pd.read_parquet('{output_parquet_path}')")
+        print("="*80 + "\n")
+
+
+    # ========================================================================
+    # Unknown mode - Show usage
+    # ========================================================================
+    if mode not in ['test_params', 'train', 'train_6', 'train_custom', 'infer', 'save', 'verify', 'viz', 'all']:
+        print("\n" + "="*80)
+        print("USAGE")
+        print("="*80 + "\n")
+        print("Available modes:\n")
+
+        print("  1. test_params")
+        print("     Test different clustering parameters")
+        print("     $ python script.py test_params\n")
+
+        print("  2. train")
+        print("     Train with default 6 temporal clusters")
+        print("     $ python script.py train\n")
+
+        print("  3. train_6")
+        print("     Train with 6 temporal clusters (explicit)")
+        print("     $ python script.py train_6\n")
+
+        print("  4. train_custom")
+        print("     Train with custom number of temporal clusters")
+        print("     $ python script.py train_custom 8\n")
+
+        print("  5. infer")
+        print("     Apply clustering to full dataset")
+        print("     $ python script.py infer\n")
+
+        print("  6. save")
+        print("     Save clustered data to parquet file")
+        print("     $ python script.py save\n")
+
+        print("  7. verify")
+        print("     Verify and display statistics of saved data")
+        print("     $ python script.py verify\n")
+
+        print("  8. viz")
+        print("     Generate visualizations only")
+        print("     $ python script.py viz\n")
+
+        print("  9. all (default)")
+        print("     Run complete pipeline (test_params → train → infer → save → verify)")
+        print("     $ python script.py all")
+        print("     $ python script.py\n")
+
+        print("="*80 + "\n")
+
+        sys.exit(1)

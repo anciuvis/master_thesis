@@ -53,11 +53,13 @@ print("="*80)
 
 # Load the clustered dataset
 input_path = 'C:/Users/Anya/master_thesis/output'
-output_path = 'C:/Users/Anya/master_thesis/output/models'
+#output_path = 'C:/Users/Anya/master_thesis/output/models'
+output_path = 'C:/Users/Anya/master_thesis/output/models_new_clustering'
 os.makedirs(output_path, exist_ok=True)
 
 # Load parquet file
-data = pd.read_parquet(os.path.join(input_path, 'taxi_data_with_clusters_full.parquet'))
+#data = pd.read_parquet(os.path.join(input_path, 'taxi_data_with_clusters_full.parquet'))
+data = pd.read_parquet(os.path.join(input_path, 'taxi_data_cleaned_full_with_clusters.parquet'))
 
 print(data.head())
 

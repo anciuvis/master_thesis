@@ -1,7 +1,7 @@
 ====================================================================================================
 HIERARCHICAL SPATIOTEMPORAL CLUSTERING SUMMARY
 ====================================================================================================
-Generated: 2025-12-11 00:08:17
+Generated: 2025-12-13 19:34:27
 
 OVERVIEW:
 ----------------------------------------------------------------------------------------------------
@@ -13,9 +13,9 @@ Noise points: 15,003 (1.00%)
 
 TEMPORAL PATTERNS:
 ----------------------------------------------------------------------------------------------------
-T0: Temporal 0 (256,226 trips, 17.08%)
-T1: Temporal 1 (256,347 trips, 17.09%)
-T2: Temporal 2 (288,297 trips, 19.22%)
-T3: Temporal 3 (249,130 trips, 16.61%)
-T4: Temporal 4 (203,030 trips, 13.54%)
-T5: Temporal 5 (246,970 trips, 16.46%)
+T0: Weekday Morning Rush (256,226 trips, 17.08%)
+T1: Weekend/Night (256,347 trips, 17.09%)
+T2: Weekday Evening Rush (288,297 trips, 19.22%)
+T3: Weekday Evening Rush (249,130 trips, 16.61%)
+T4: Weekend/Night (203,030 trips, 13.54%)
+T5: Weekday Morning Rush (246,970 trips, 16.46%)
