@@ -1,0 +1,116 @@
+====================================================================================================
+SPATIAL CLUSTERING REPORT - FINE-GRAINED ZONES (HDBSCAN)
+====================================================================================================
+
+CLUSTERING ALGORITHM: HDBSCAN (Hierarchical Density-Based Spatial Clustering)
+(Replaces DBSCAN - density-adaptive, prevents large bridging clusters)
+
+CLUSTERING PARAMETERS:
+  min_cluster_size: 20 points
+  min_samples: 10 points
+  cluster_selection_epsilon: 0.15 km
+  metric: haversine (geographic distance)
+  Granularity: ~150 meters per zone
+
+RESULTS:
+  Total hierarchical clusters: 533
+  Total classified trips: 1,484,997
+
+DISPATCHER-FRIENDLY ZONE DESCRIPTIONS (Top 20):
+----------------------------------------------------------------------------------------------------
+             Zone_ID |    Trips |       Lat |        Lon |  Spread | Avg_Dist | Avg_Fare
+----------------------------------------------------------------------------------------------------
+              T2_S65 |   12,139 |   40.7513 |   -73.9766 |    0.13 |     2.10 | $  10.20
+              T2_S32 |    9,215 |   40.7551 |   -73.9703 |    0.12 |     2.12 | $  10.02
+              T2_S42 |    8,717 |   40.7577 |   -73.9752 |    0.08 |     1.99 | $  10.00
+              T2_S24 |    8,557 |   40.7430 |   -73.9876 |    0.09 |     2.00 | $   9.85
+              T0_S50 |    7,996 |   40.7695 |   -73.9541 |    0.12 |     2.22 | $  10.90
+              T2_S27 |    7,846 |   40.7656 |   -73.9817 |    0.08 |     1.99 | $   9.86
+              T2_S26 |    7,830 |   40.7365 |   -73.9883 |    0.11 |     2.06 | $  10.05
+              T2_S12 |    7,781 |   40.7613 |   -73.9698 |    0.09 |     1.98 | $   9.75
+              T0_S71 |    7,623 |   40.7797 |   -73.9564 |    0.12 |     1.86 | $   9.89
+              T0_S15 |    7,452 |   40.7497 |   -73.9911 |    0.10 |     1.61 | $   9.48
+              T2_S23 |    7,409 |   40.7635 |   -73.9748 |    0.08 |     1.94 | $   9.83
+               T2_S8 |    7,271 |   40.7498 |   -73.9897 |    0.08 |     2.02 | $   9.99
+              T2_S22 |    7,082 |   40.7551 |   -73.9840 |    0.10 |     2.06 | $   9.95
+              T1_S58 |    6,934 |   40.7636 |   -73.9704 |    0.09 |     1.74 | $   8.91
+              T0_S14 |    6,811 |   40.7518 |   -73.9772 |    0.07 |     1.73 | $   9.88
+              T2_S28 |    6,640 |   40.7397 |   -73.9933 |    0.11 |     1.94 | $   9.67
+              T2_S63 |    6,596 |   40.7798 |   -73.9804 |    0.15 |     1.81 | $   8.93
+               T2_S0 |    6,586 |   40.7475 |   -73.9832 |    0.10 |     2.01 | $   9.91
+               T2_S3 |    6,572 |   40.7607 |   -73.9855 |    0.08 |     2.02 | $   9.77
+              T2_S33 |    6,555 |   40.7419 |   -73.9785 |    0.14 |     1.99 | $   9.68
+
+
+ZONE BOUNDARIES (for routing systems):
+----------------------------------------------------------------------------------------------------
+
+T2_S65:
+  Latitude range: 40.7454 to 40.7556
+  Longitude range: -73.9813 to -73.9705
+  Center: (40.7513, -73.9766)
+  Spread: 0.13 km
+  Trip count: 12,139 (0.81%)
+
+T2_S32:
+  Latitude range: 40.7422 to 40.7584
+  Longitude range: -73.9740 to -73.9585
+  Center: (40.7551, -73.9703)
+  Spread: 0.12 km
+  Trip count: 9,215 (0.61%)
+
+T2_S42:
+  Latitude range: 40.7541 to 40.7607
+  Longitude range: -73.9794 to -73.9716
+  Center: (40.7577, -73.9752)
+  Spread: 0.08 km
+  Trip count: 8,717 (0.58%)
+
+T2_S24:
+  Latitude range: 40.7398 to 40.7471
+  Longitude range: -73.9926 to -73.9835
+  Center: (40.7430, -73.9876)
+  Spread: 0.09 km
+  Trip count: 8,557 (0.57%)
+
+T0_S50:
+  Latitude range: 40.7648 to 40.7753
+  Longitude range: -73.9589 to -73.9495
+  Center: (40.7695, -73.9541)
+  Spread: 0.12 km
+  Trip count: 7,996 (0.53%)
+
+T2_S27:
+  Latitude range: 40.7623 to 40.7685
+  Longitude range: -73.9863 to -73.9777
+  Center: (40.7656, -73.9817)
+  Spread: 0.08 km
+  Trip count: 7,846 (0.52%)
+
+T2_S26:
+  Latitude range: 40.7322 to 40.7400
+  Longitude range: -73.9930 to -73.9821
+  Center: (40.7365, -73.9883)
+  Spread: 0.11 km
+  Trip count: 7,830 (0.52%)
+
+T2_S12:
+  Latitude range: 40.7580 to 40.7653
+  Longitude range: -73.9730 to -73.9661
+  Center: (40.7613, -73.9698)
+  Spread: 0.09 km
+  Trip count: 7,781 (0.52%)
+
+T0_S71:
+  Latitude range: 40.7748 to 40.7842
+  Longitude range: -73.9635 to -73.9522
+  Center: (40.7797, -73.9564)
+  Spread: 0.12 km
+  Trip count: 7,623 (0.51%)
+
+T0_S15:
+  Latitude range: 40.7455 to 40.7529
+  Longitude range: -73.9932 to -73.9883
+  Center: (40.7497, -73.9911)
+  Spread: 0.10 km
+  Trip count: 7,452 (0.50%)
