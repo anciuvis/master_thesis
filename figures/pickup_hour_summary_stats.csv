@@ -1,0 +1,7 @@
+Metric,Weekday,Weekend
+Mean Pickup Hour,13.98,12.77
+Median Pickup Hour,15.00,14.00
+Std Dev Pickup Hour,6.06,6.98
+Peak Hour,19.00,18.00
+Trips at Peak Hour,2153664.00,785979.00
+Total Trips,32785326.00,13298415.00
