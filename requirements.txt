@@ -1,0 +1,150 @@
+# Master Thesis: Improving Urban Mobility Using NYC Taxi Data
+# Data Science - Vilnius University
+# ============================================================================
+
+# Core Data Science & Analysis Libraries
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# Visualization Libraries
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Statistical Modeling
+statsmodels>=0.14.0
+
+# Gradient Boosting
+xgboost>=2.0.0
+
+# Deep Learning Framework
+tensorflow>=2.13.0
+keras>=2.13.0
+
+# Data Processing & Utilities
+joblib>=1.3.0
+pyarrow>=12.0.0
+
+# Dataset Download
+kagglehub>=0.2.0
+
+# General Utilities
+pathlib2>=2.3.0
+
+# ============================================================================
+# OPTIONAL: Development & Visualization Tools
+# ============================================================================
+# jupyter>=1.0.0        # For Jupyter notebooks
+# jupyterlab>=4.0.0     # Enhanced Jupyter interface
+# ipython>=8.0.0        # Enhanced Python shell
+
+# ============================================================================
+# NOTES FOR INSTALLATION
+# ============================================================================
+# 1. Core Installation:
+#    pip install -r requirements.txt
+#
+# 2. GPU Support (for TensorFlow/CUDA):
+#    pip install tensorflow[and-cuda]>=2.13.0
+#
+# 3. For Development:
+#    pip install jupyter jupyterlab ipython
+#
+# 4. Kaggle API Setup:
+#    - Place your kaggle.json in ~/.kaggle/
+#    - Or set KAGGLE_USERNAME and KAGGLE_KEY environment variables
+#
+# ============================================================================
+# PACKAGE DESCRIPTIONS
+# ============================================================================
+# 
+# DATA HANDLING:
+# - pandas: Data manipulation and analysis (DataFrames, time series)
+# - numpy: Numerical computing (arrays, linear algebra)
+# - scipy: Scientific computing (statistics, optimization, clustering)
+# - pyarrow: Apache Arrow for efficient data processing and storage
+#
+# MACHINE LEARNING:
+# - scikit-learn: Classical ML (preprocessing, clustering, metrics, VAR models)
+#   Key modules used:
+#     * preprocessing: MinMaxScaler, StandardScaler, RobustScaler
+#     * model_selection: TimeSeriesSplit, GridSearchCV
+#     * metrics: MSE, MAE, MAPE, silhouette_score
+#     * cluster: DBSCAN, hierarchical clustering
+#     * neighbors: KNeighborsClassifier
+# - xgboost: Gradient boosting for tabular data
+# - statsmodels: Statistical models (VAR, ADF tests, Granger causality)
+#
+# DEEP LEARNING:
+# - tensorflow: End-to-end open-source platform for ML
+# - keras: High-level neural network API (part of TensorFlow)
+#   Key layers used:
+#     * ConvLSTM2D: Spatiotemporal feature extraction
+#     * LSTM: Long Short-Term Memory for sequences
+#     * Conv2D/Conv3D: Convolutional layers
+#     * BatchNormalization, Dropout: Regularization
+#
+# VISUALIZATION:
+# - matplotlib: 2D plotting library
+# - seaborn: Statistical data visualization (built on matplotlib)
+#
+# UTILITIES:
+# - joblib: Serialization and parallelization
+# - kagglehub: Download datasets directly from Kaggle
+#
+# STATISTICAL ANALYSIS:
+# - scipy.stats: Statistical functions
+# - scipy.cluster: Hierarchical clustering algorithms
+#
+# ============================================================================
+# PROJECT STRUCTURE REFERENCE
+# ============================================================================
+#
+# Data Pipeline:
+#   C_00_cleaning_pipeline_with_visualizations.py
+#     - Data loading, feature engineering, outlier detection
+#     - Requires: pandas, numpy, scipy, matplotlib, seaborn, sklearn, kagglehub
+#
+# Clustering:
+#   B_01_stdbscan_clustering_adj.py
+#     - ST-DBSCAN (spatiotemporal clustering)
+#     - Hierarchical pattern merging
+#     - KNN for full dataset inference
+#     - Requires: pandas, numpy, scipy, sklearn, joblib, matplotlib
+#
+# Time Series Modeling:
+#   A_02_initial_pipeline.py
+#     - VAR (Vector Autoregression)
+#     - XGBoost with hyperparameter tuning
+#     - ConvLSTM for spatiotemporal prediction
+#     - Requires: pandas, numpy, statsmodels, xgboost, sklearn, tensorflow, keras, matplotlib
+#
+# Analysis & Comparison:
+#   A_03_2_comparison_all_models.ipynb
+#     - Model performance comparison
+#     - Visualization and analysis
+#     - Requires: All above + pandas, numpy, matplotlib
+#
+# ============================================================================
+# FEATURE ENGINEERING & ANALYSIS METHODS
+# ============================================================================
+#
+# Spatiotemporal Clustering (ST-DBSCAN):
+#   - Euclidean distance in KM-projected space
+#   - Temporal distance via circular statistics (sin/cos encoding)
+#   - Hierarchical merging based on temporal profiles
+#   - Reference: Proximity-based ST-DBSCAN (modified for taxi demand)
+#
+# Time Series Models:
+#   1. VAR: Stationarity testing (ADF), optimal lag selection
+#   2. XGBoost: Lag features, rolling statistics, temporal encoding
+#   3. ConvLSTM: Multi-branch (closeness, period, trend) with residual learning
+#
+# Evaluation Metrics:
+#   - RMSE (Root Mean Squared Error)
+#   - MAE (Mean Absolute Error)
+#   - MAPE (Mean Absolute Percentage Error)
+#   - Silhouette Score (clustering quality)
+#
+# ============================================================================
