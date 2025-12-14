@@ -1,6 +1,13 @@
 # Master Thesis: Improving Urban Mobility Using NYC Taxi Data
 # Data Science - Vilnius University
 # ============================================================================
+# Main Workflow:
+# 1. C_00_cleaning_pipeline_with_visualizations.py - Data cleaning & visualization
+# 2. C_00_demand_analysis.py - Demand distribution analysis
+# 3. C_01_1_hierarchical_clustering.py - Spatiotemporal clustering (HDBSCAN)
+# 4. C_01_2_cleanup_checkpoints.py - Checkpoint management utility
+# 5. C_02_1_pipeline_upd.py - SARIMA + XGBoost + LSTM forecasting models
+# ============================================================================
 
 # Core Data Science & Analysis Libraries
 pandas>=2.0.0
@@ -12,11 +19,18 @@ scikit-learn>=1.3.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 
-# Statistical Modeling
+# Geospatial Visualization
+geopandas>=0.12.0
+contextily>=1.3.0
+
+# Statistical Modeling & Time Series
 statsmodels>=0.14.0
 
 # Gradient Boosting
 xgboost>=2.0.0
+
+# Clustering Algorithms
+hdbscan>=0.8.30
 
 # Deep Learning Framework
 tensorflow>=2.13.0
@@ -29,122 +43,203 @@ pyarrow>=12.0.0
 # Dataset Download
 kagglehub>=0.2.0
 
-# General Utilities
-pathlib2>=2.3.0
+# Feature Importance & Explainability (Optional but recommended)
+shap>=0.42.0
 
 # ============================================================================
-# OPTIONAL: Development & Visualization Tools
+# OPTIONAL: Development & Interactive Tools
 # ============================================================================
 # jupyter>=1.0.0        # For Jupyter notebooks
 # jupyterlab>=4.0.0     # Enhanced Jupyter interface
 # ipython>=8.0.0        # Enhanced Python shell
 
 # ============================================================================
-# NOTES FOR INSTALLATION
+# INSTALLATION INSTRUCTIONS
 # ============================================================================
-# 1. Core Installation:
+#
+# 1. BASIC INSTALLATION:
 #    pip install -r requirements.txt
 #
-# 2. GPU Support (for TensorFlow/CUDA):
+# 2. GPU SUPPORT (TensorFlow with CUDA):
 #    pip install tensorflow[and-cuda]>=2.13.0
 #
-# 3. For Development:
+# 3. FOR DEVELOPMENT/NOTEBOOKS:
 #    pip install jupyter jupyterlab ipython
 #
-# 4. Kaggle API Setup:
-#    - Place your kaggle.json in ~/.kaggle/
-#    - Or set KAGGLE_USERNAME and KAGGLE_KEY environment variables
+# 4. KAGGLE API SETUP:
+#    - Download kaggle.json from https://www.kaggle.com/account
+#    - Place it in ~/.kaggle/
+#    - Run: chmod 600 ~/.kaggle/kaggle.json
 #
 # ============================================================================
-# PACKAGE DESCRIPTIONS
-# ============================================================================
-# 
-# DATA HANDLING:
-# - pandas: Data manipulation and analysis (DataFrames, time series)
-# - numpy: Numerical computing (arrays, linear algebra)
-# - scipy: Scientific computing (statistics, optimization, clustering)
-# - pyarrow: Apache Arrow for efficient data processing and storage
-#
-# MACHINE LEARNING:
-# - scikit-learn: Classical ML (preprocessing, clustering, metrics, VAR models)
-#   Key modules used:
-#     * preprocessing: MinMaxScaler, StandardScaler, RobustScaler
-#     * model_selection: TimeSeriesSplit, GridSearchCV
-#     * metrics: MSE, MAE, MAPE, silhouette_score
-#     * cluster: DBSCAN, hierarchical clustering
-#     * neighbors: KNeighborsClassifier
-# - xgboost: Gradient boosting for tabular data
-# - statsmodels: Statistical models (VAR, ADF tests, Granger causality)
-#
-# DEEP LEARNING:
-# - tensorflow: End-to-end open-source platform for ML
-# - keras: High-level neural network API (part of TensorFlow)
-#   Key layers used:
-#     * ConvLSTM2D: Spatiotemporal feature extraction
-#     * LSTM: Long Short-Term Memory for sequences
-#     * Conv2D/Conv3D: Convolutional layers
-#     * BatchNormalization, Dropout: Regularization
-#
-# VISUALIZATION:
-# - matplotlib: 2D plotting library
-# - seaborn: Statistical data visualization (built on matplotlib)
-#
-# UTILITIES:
-# - joblib: Serialization and parallelization
-# - kagglehub: Download datasets directly from Kaggle
-#
-# STATISTICAL ANALYSIS:
-# - scipy.stats: Statistical functions
-# - scipy.cluster: Hierarchical clustering algorithms
-#
-# ============================================================================
-# PROJECT STRUCTURE REFERENCE
+# MAIN WORKFLOW DEPENDENCIES
 # ============================================================================
 #
-# Data Pipeline:
-#   C_00_cleaning_pipeline_with_visualizations.py
-#     - Data loading, feature engineering, outlier detection
-#     - Requires: pandas, numpy, scipy, matplotlib, seaborn, sklearn, kagglehub
+# STAGE 1: Data Cleaning (C_00_cleaning_pipeline_with_visualizations.py)
+#   - pandas: Read, clean, and manipulate raw CSV data
+#   - numpy: Numerical operations and array manipulation
+#   - scipy.stats: Statistical tests for outlier detection
+#   - sklearn.preprocessing: RobustScaler for data normalization
+#   - matplotlib, seaborn: Visualization of distributions and boxplots
+#   - kagglehub: Download NYC taxi dataset
+#   - joblib: Save preprocessing scaler
+#
+# STAGE 2: Demand Analysis (C_00_demand_analysis.py)
+#   - pandas: Time series aggregation and statistics
+#   - numpy: Numerical computations
+#   - matplotlib, seaborn: Demand distribution visualizations
+#   [Creates tier classification for hierarchical modeling]
+#
+# STAGE 3: Spatiotemporal Clustering (C_01_1_hierarchical_clustering.py)
+#   - pandas: Data manipulation and cluster assignment
+#   - numpy: Spatial distance calculations
+#   - sklearn.preprocessing: StandardScaler for coordinate normalization
+#   - sklearn.cluster: KMeans for temporal clustering
+#   - hdbscan: Density-based spatial clustering (HDBSCAN algorithm)
+#   - scipy.spatial.distance: Pairwise distance calculations
+#   - scipy.cluster.hierarchy: Hierarchical clustering for pattern merging
+#   - matplotlib, seaborn: Cluster visualization
+#   - geopandas, contextily: Geographic visualization with basemaps
+#   - joblib: Save clustering models and checkpoints
+#
+# STAGE 4: Checkpoint Management (C_01_2_cleanup_checkpoints.py)
+#   - pathlib: File system operations
+#   [Utility script - minimal dependencies]
+#
+# STAGE 5: Demand Forecasting (C_02_1_pipeline_upd.py)
+#   - pandas: Time series data preparation
+#   - numpy: Numerical operations
+#   - statsmodels.tsa.statespace.sarimax: SARIMA modeling
+#   - statsmodels.tsa.stattools: Stationarity tests (ADF, KPSS)
+#   - statsmodels.tsa.seasonal: Seasonal decomposition
+#   - sklearn.preprocessing: MinMaxScaler, StandardScaler for feature scaling
+#   - sklearn.model_selection: TimeSeriesSplit for proper temporal CV
+#   - sklearn.metrics: RMSE, MAE, MAPE, R² score
+#   - xgboost.XGBRegressor: Gradient boosting regression
+#   - tensorflow.keras: LSTM encoder-decoder for deep learning
+#   - shap: SHAP values for model interpretability (optional)
+#   - matplotlib, seaborn: Model comparison visualizations
+#   - joblib: Model serialization and checkpoint management
+#
+# ============================================================================
+# KEY ALGORITHMS & METHODS
+# ============================================================================
+#
+# DATA CLEANING:
+#   - Multi-stage outlier detection (validity checks, geographic bounds, speed limits)
+#   - IQR-based filtering for trip duration and distance
+#   - Robust scaling for statistical analysis
+#
+# SPATIOTEMPORAL CLUSTERING:
+#   - Temporal K-Means: 6 clusters based on temporal patterns
+#   - HDBSCAN: Density-adaptive spatial clustering (density-based)
+#   - Hybrid approach: HDBSCAN discovers hotspots, KMeans refines
+#   - Result: 80+ fine-grained geographic zones
+#
+# DEMAND FORECASTING:
+#   - SARIMA: Seasonal ARIMA with rolling forecast
+#   - XGBoost: Tree-based with lag features and early stopping
+#   - LSTM: Encoder-decoder RNN for sequence prediction
+#   - Evaluation: RMSE, MAE, MAPE, R² score
+#
+# ============================================================================
+# FEATURE ENGINEERING
+# ============================================================================
+#
+# Temporal Features:
+#   - Hour of day (24 values) + sin/cos encoding for circularity
+#   - Day of week (0-6) + sin/cos encoding
+#   - Is weekend, is rush hour boolean flags
+#
+# Spatial Features:
+#   - Euclidean distance from cluster center
+#   - Latitude/longitude in km units (scaled)
+#   - Geographic spread (km) of clusters
+#
+# Lag Features (for XGBoost/LSTM):
+#   - Demand lags: 1 to 168 hours (1 week)
+#   - Rolling mean/std: 6-hour and 24-hour windows
+#   - Temporal features: hour, day_of_week, is_weekend, is_rush_hour
+#
+# ============================================================================
+# DATA FLOW
+# ============================================================================
+#
+# Raw Data (42.8M NYC taxi trips 2015-2016)
+#        ↓
+# [Stage 1] Cleaning Pipeline → taxi_data_cleaned_full.parquet (2.8GB)
+#        ↓
+# [Stage 2] Demand Analysis → cluster_tier_assignments.csv
+#        ↓
+# [Stage 3] Spatiotemporal Clustering → taxi_data_cleaned_full_with_clusters.parquet
+#        ├─ 6 temporal clusters (K-Means on temporal features)
+#        └─ 80+ spatial zones (HDBSCAN on coordinates)
+#        ↓
+# [Stage 5] Forecasting Models
+#        ├─ SARIMA: Univariate time series per cluster
+#        ├─ XGBoost: Multi-output regression with lags
+#        └─ LSTM: Sequence-to-sequence encoder-decoder
+#        ↓
+# Outputs: Predictions, metrics, feature importance, visualizations
+#
+# ============================================================================
+# COMPUTATIONAL REQUIREMENTS
+# ============================================================================
+#
+# RAM: 32+ GB recommended
+#   - Raw data loading: ~5-8 GB
+#   - Clustering computations: ~10-15 GB
+#   - Model training: ~8-12 GB
+#
+# Storage:
+#   - Cleaned data: ~2.8 GB
+#   - Clustered data: ~3.2 GB
+#   - Models and checkpoints: ~2-3 GB
+#
+# Time (on modern CPU/GPU):
+#   - Data cleaning: 30-45 minutes
+#   - Clustering: 60-90 minutes
+#   - Model training: 45-120 minutes
+#   - Total: 2-4 hours
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# 1. Memory Issues:
+#    - Reduce SAMPLE_SIZE in config dictionaries
+#    - Process in smaller batches
+#    - Increase SWAP space
+#
+# 2. HDBSCAN Issues:
+#    - Ensure spatial data is StandardScaled
+#    - Tune min_cluster_size parameter
+#    - Check for empty clusters with (labels == -1).sum()
+#
+# 3. SARIMA Convergence:
+#    - Set enforce_stationarity=False
+#    - Try different (p,d,q) combinations
+#    - Reduce maxiter if timeout occurs
+#
+# 4. TensorFlow GPU Issues:
+#    - pip install tensorflow[and-cuda]==2.13.0
+#    - Check: python -c "import tensorflow as tf; print(tf.sysconfig.get_build_info()['cuda_version'])"
+#
+# ============================================================================
+# REFERENCES
+# ============================================================================
 #
 # Clustering:
-#   B_01_stdbscan_clustering_adj.py
-#     - ST-DBSCAN (spatiotemporal clustering)
-#     - Hierarchical pattern merging
-#     - KNN for full dataset inference
-#     - Requires: pandas, numpy, scipy, sklearn, joblib, matplotlib
+# - HDBSCAN: Campello et al. (2013) "Density-based clustering based on hierarchical density estimates"
+# - K-Means: Lloyd (1957) "Least squares quantization in PCM"
 #
-# Time Series Modeling:
-#   A_02_initial_pipeline.py
-#     - VAR (Vector Autoregression)
-#     - XGBoost with hyperparameter tuning
-#     - ConvLSTM for spatiotemporal prediction
-#     - Requires: pandas, numpy, statsmodels, xgboost, sklearn, tensorflow, keras, matplotlib
+# Forecasting:
+# - SARIMA: Box & Jenkins (1970) "Time series analysis: forecasting and control"
+# - XGBoost: Chen & Guestrin (2016) "XGBoost: A Scalable Tree Boosting System"
+# - LSTM: Hochreiter & Schmidhuber (1997) "Long Short-Term Memory"
 #
-# Analysis & Comparison:
-#   A_03_2_comparison_all_models.ipynb
-#     - Model performance comparison
-#     - Visualization and analysis
-#     - Requires: All above + pandas, numpy, matplotlib
-#
-# ============================================================================
-# FEATURE ENGINEERING & ANALYSIS METHODS
-# ============================================================================
-#
-# Spatiotemporal Clustering (ST-DBSCAN):
-#   - Euclidean distance in KM-projected space
-#   - Temporal distance via circular statistics (sin/cos encoding)
-#   - Hierarchical merging based on temporal profiles
-#   - Reference: Proximity-based ST-DBSCAN (modified for taxi demand)
-#
-# Time Series Models:
-#   1. VAR: Stationarity testing (ADF), optimal lag selection
-#   2. XGBoost: Lag features, rolling statistics, temporal encoding
-#   3. ConvLSTM: Multi-branch (closeness, period, trend) with residual learning
-#
-# Evaluation Metrics:
-#   - RMSE (Root Mean Squared Error)
-#   - MAE (Mean Absolute Error)
-#   - MAPE (Mean Absolute Percentage Error)
-#   - Silhouette Score (clustering quality)
+# NYC Taxi Dataset:
+# - https://www.kaggle.com/datasets/elemento/nyc-yellow-taxi-trip-data
+# - TLC Taxi Records: https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page
 #
 # ============================================================================
