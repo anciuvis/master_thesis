@@ -252,14 +252,14 @@ def add_temporal_features(demand_matrix: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def create_lag_features(data: pd.DataFrame, lags: int = 24) -> pd.DataFrame:
+def create_lag_features(data: pd.DataFrame, lags: int = 168) -> pd.DataFrame:
     """Create lag features for XGBoost and LSTM"""
     logger.info(f"Creating lag features (lags={lags})...")
     progress.update(14, f"Creating {lags} lag features")
     
     df = data.copy()
     
-    # FIX #2: Identify demand columns (exclude temporal features)
+    # Identify demand columns (exclude temporal features)
     temporal_feature_cols = [
         'hour', 'day_of_week', 'day_of_month', 'month', 'is_weekend', 
         'is_rush_hour', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos'
@@ -270,9 +270,15 @@ def create_lag_features(data: pd.DataFrame, lags: int = 24) -> pd.DataFrame:
     
     # Create lags for each cluster
     for col in demand_cols:
-        for lag in range(1, lags + 1):
+        # single integer or list of lags
+        if isinstance(lags, list):
+            lag_list = lags
+        else:
+            lag_list = list(range(1, lags + 1))
+        
+        for lag in lag_list:
             df[f'{col}_lag_{lag}'] = data[col].shift(lag)
-    
+        
     # Rolling statistics
     for col in demand_cols:
         df[f'{col}_rolling_mean_6'] = data[col].shift(1).rolling(window=6).mean()
@@ -477,7 +483,7 @@ class XGBoostOptimizer:
         
         self.feature_names = X_train.columns.tolist()
         
-        # ALWAYS compute gain-based importance (fast, reliable)
+        # compute gain-based importance
         logger.info("Computing gain-based feature importance...")
         first_cluster = list(self.models.keys())[0]
         self._compute_gain_importance(self.models[first_cluster])
@@ -687,25 +693,25 @@ if not checkpoint_mgr.is_complete('features_engineered'):
     print("STEP 2: FEATURE ENGINEERING")
     print("="*80)
     
-    # FIX #2: Properly separate demand and feature columns
+    # Properly separate demand and feature columns
     train_features, demand_cols, temporal_feature_cols = create_lag_features(
-        demand_matrix.iloc[:len(train_data)], lags=24
+        demand_matrix.iloc[:len(train_data)], lags=168
     )
-    test_features_all, _, _ = create_lag_features(demand_matrix, lags=24)
+    test_features_all, _, _ = create_lag_features(demand_matrix, lags=168)
     test_features = test_features_all.iloc[len(train_data):]
     
     # Select top demand clusters for modeling
     top_n_clusters = 30
     top_clusters = demand_matrix.sum().nlargest(top_n_clusters).index.tolist()
     
-    logger.info(f"\nCluster demand distribution (top 15):")
-    cluster_dist = demand_matrix.sum().sort_values(ascending=False).head(15)
+    logger.info(f"\nCluster demand distribution (top 30):")
+    cluster_dist = demand_matrix.sum().sort_values(ascending=False).head(30)
     for cluster, demand in cluster_dist.items():
         pct = 100 * demand / demand_matrix.sum().sum()
         logger.info(f"  {cluster}: {demand:,.0f} trips ({pct:.1f}%)")
     logger.info(f"Top {top_n_clusters} clusters represent {cluster_dist[:top_n_clusters].sum() / demand_matrix.sum().sum() * 100:.1f}% of demand")
     
-    # FIX #2: Feature columns = lags + temporal, excluding original demand
+    # Feature columns = lags + temporal, excluding original demand
     feature_cols = [col for col in train_features.columns 
                     if col not in demand_cols and col not in temporal_feature_cols]
     
@@ -887,20 +893,32 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     sarima_predictions = {}
     for cluster in fitted_sarima:
         try:
-            predictor = sarima_models[str(cluster)]
             preds = []
-            history = list(train_data[cluster].values)
+            history = pd.Series(train_data[cluster].values, index=train_data.index)
             
             for t in range(len(test_data)):
-                # Forecast next step
-                fc = predictor.forecast(steps=1)
-                preds.append(fc[0])
-                
-                if t < len(test_data):
-                    history.append(test_data[cluster].iloc[t])
+                try:
+                    model_refit = SARIMAX(
+                        history, 
+                        order=(1,1,1), 
+                        seasonal_order=(1,1,1,24),
+                        enforce_stationarity=False, 
+                        enforce_invertibility=False
+                    )
+                    results_refit = model_refit.fit(disp=False, maxiter=200)
+                    
+                    fc = results_refit.get_forecast(steps=1).predicted_mean.values
+                    preds.append(fc[0])
+                    
+                    new_idx = test_data.index[t]
+                    history = pd.concat([history, pd.Series([test_data[cluster].iloc[t]], index=[new_idx])])
+                    
+                except Exception as e_inner:
+                    logger.warning(f"[!] SARIMA refit failed at step {t} for {cluster}: {e_inner}")
+                    preds.append(np.nan)
             
             sarima_predictions[cluster] = np.array(preds)
-            logger.info(f"[OK] SARIMA rolling forecast completed for {cluster}")
+            logger.info(f"[OK] SARIMA rolling forecast (with refitting) completed for {cluster}")
         except Exception as e:
             logger.warning(f"[!] SARIMA forecast failed for cluster {cluster}: {e}")
     
@@ -1011,6 +1029,25 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
     if sample_cluster in y_test.columns:
         actual = y_test[sample_cluster].values[:100]
         
+        # VERIFY SCALER FEATURE ORDER CONSISTENCY
+        logger.info(f"\n=== SCALER FEATURE ORDER VERIFICATION ===")
+        logger.info(f"  X_test shape: {X_test.shape}")
+        logger.info(f"  Scaler n_features_in_: {scaler.n_features_in_}")
+        logger.info(f"  LSTM predictions shape: {lstm_predictions.shape}")
+        
+        if scaler.n_features_in_ != X_test.shape[1]:
+            logger.warning(f"[!] SCALER MISMATCH: Expected {X_test.shape[1]}, got {scaler.n_features_in_}")
+        else:
+            logger.info(f"[OK] Scaler features match X_test shape")
+        
+        if sample_cluster in X_test.columns:
+            cluster_idx = list(X_test.columns).index(sample_cluster)
+            logger.info(f"  Cluster '{sample_cluster}' is at index {cluster_idx} in X_test.columns")
+        else:
+            logger.warning(f"[!] Cluster {sample_cluster} not found in X_test.columns")
+        
+        logger.info(f"=========================================\n")
+        
         fig, ax = plt.subplots(figsize=(14, 6))
         ax.plot(actual, 'k-', label='Actual', linewidth=2)
         
@@ -1020,6 +1057,15 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
         if sample_cluster in sarima_predictions:
             ax.plot(sarima_predictions[sample_cluster][:100], 'g--', label='SARIMA', alpha=0.7)
         
+        # LSTM line - NEW
+        if sample_cluster in X_test.columns:
+            cluster_idx = list(X_test.columns).index(sample_cluster)
+            lstm_vals = lstm_predictions[:100, cluster_idx]
+            ax.plot(lstm_vals, 'm--', label='LSTM', alpha=0.7)
+            logger.info(f"[OK] LSTM line plotted for cluster {sample_cluster}")
+        else:
+            logger.warning(f"[!] Cluster {sample_cluster} not found in X_test.columns - skipping LSTM plot")
+        
         ax.set_title(f'Forecast Comparison - Cluster {sample_cluster}')
         ax.set_ylabel('Demand')
         ax.legend()
@@ -1028,6 +1074,7 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
         plt.savefig(os.path.join(VIZ_DIR, 'forecast_comparison.png'), dpi=300, bbox_inches='tight')
         plt.close()
         logger.info("[OK] Forecast comparison plot saved")
+
     gc.collect()
     checkpoint_mgr.mark_complete('visualizations_created')
 
