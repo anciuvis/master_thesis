@@ -1,23 +1,23 @@
 ====================================================================================================
-🚀 NYC TAXI DATA CLEANING PIPELINE WITH FOCUSED VISUALIZATIONS
+NYC TAXI DATA CLEANING PIPELINE WITH FOCUSED VISUALIZATIONS
 ====================================================================================================
-📂 Searching for files matching: C:/Users/Anya/master_thesis/tmp/chunk_*.parquet
+Searching for files matching: C:/Users/Anya/master_thesis/tmp/chunk_*.parquet
 Found 49 parquet files. Loading...
 Raw combined data shape: (46.2m, 20)
 Column names: ['VendorID', 'tpep_pickup_datetime', 'tpep_dropoff_datetime', 'passenger_count', 'trip_distance', 'pickup_longitude', 'pickup_latitude', 'RateCodeID', 'store_and_fwd_flag', 'dropoff_longitude', 'dropoff_latitude', 'payment_type', 'fare_amount', 'extra', 'mta_tax', 'tip_amount', 'tolls_amount', 'improvement_surcharge', 'total_amount', 'RatecodeID']
-🗑️  Dropping columns: ['VendorID', 'RateCodeID', 'store_and_fwd_flag', 'extra', 'mta_tax', 'tolls_amount', 'improvement_surcharge', 'passenger_count', 'payment_type', 'tip_amount', 'total_amount']
-📉 Removed 0 rows with trip_distance <= 0
-📉 Removed 1.3k rows with 0 or negative duration
-📉 Removed 155.6k rows with identical pickup/dropoff coordinates
-✅ Data loaded and preprocessed. Shape: (46.0m, 9)
+  Dropping columns: ['VendorID', 'RateCodeID', 'store_and_fwd_flag', 'extra', 'mta_tax', 'tolls_amount', 'improvement_surcharge', 'passenger_count', 'payment_type', 'tip_amount', 'total_amount']
+ Removed 0 rows with trip_distance <= 0
+ Removed 1.3k rows with 0 or negative duration
+ Removed 155.6k rows with identical pickup/dropoff coordinates
+ Data loaded and preprocessed. Shape: (46.0m, 9)
 
-📊 Calculating derived features...
-   ℹ️ Using 'trip_distance' column (from meter/GPS) for distance calculation
-✅ Derived features created
+ Calculating derived features...
+ Using 'trip_distance' column (from meter/GPS) for distance calculation
+ Derived features created
 
 ====================================================================================================
 
-📊 PRE-PROCESSED STATISTICS (After loading + feature engineering)
+PRE-PROCESSED STATISTICS (After loading + feature engineering)
 ====================================================================================================
              Metric  Mean Median Std Dev    Min    Max
 Trip Duration (min) 15.03  10.52  153.39 0.0167 192.3k
@@ -29,49 +29,49 @@ Trip Duration (min) 15.03  10.52  153.39 0.0167 192.3k
 Dataset size: 46.0m rows
 ====================================================================================================
 
-📊 Creating raw data visualization...
+Creating raw data visualization...
 
-🧹 Stage 1: Basic validity checks...
+Stage 1: Basic validity checks...
 After basic cleaning: 46.0m (100.0%)
-   📈 Saved: 01_stage1_trip_duration_min.png
+   Saved: 01_stage1_trip_duration_min.png
       Before: 46.0m records, range: 0.02–192313.38
       After:  46.0m records, range: 0.02–192313.38
 
-🧹 Stage 2: Geographic outliers (NYC bounding box)...
+Stage 2: Geographic outliers (NYC bounding box)...
 After geographic filtering: 46.0m (removed 0)
-   📈 Saved: 02_stage2_trip_distance_km.png
+   Saved: 02_stage2_trip_distance_km.png
       Before: 46.0m records, range: 0.02–30694342.00
       After:  46.0m records, range: 0.02–30694342.00
 
-🧹 Stage 3: Speed-based outliers (1-120 km/h)...
+Stage 3: Speed-based outliers (1-120 km/h)...
 After speed filtering: 45.9m (removed 87.7k)
-   📈 Saved: 03_stage3_avg_speed_kmh.png
+   Saved: 03_stage3_avg_speed_kmh.png
       Before: 46.0m records, range: 0.00–625372892.31
       After:  45.9m records, range: 1.00–119.91
 
-🧹 Stage 4: Trip duration outliers (IQR method)...
+Stage 4: Trip duration outliers (IQR method)...
 After duration filtering: 45.4m (removed 546.1k)
-   📈 Saved: 04_stage4_trip_duration_min.png
+   Saved: 04_stage4_trip_duration_min.png
       Before: 45.9m records, range: 0.02–1474.08
       After:  45.4m records, range: 0.02–48.12
 
-🧹 Stage 5: Distance outliers (IQR method)...
+Stage 5: Distance outliers (IQR method)...
 After distance filtering: 42.9m (removed 2.5m)
-   📈 Saved: 05_stage5_trip_distance_km.png
+   Saved: 05_stage5_trip_distance_km.png
       Before: 45.4m records, range: 0.02–82.88
       After:  42.9m records, range: 0.02–14.48
 
-🧹 Stage 6: Pricing outliers...
+Stage 6: Pricing outliers...
 After pricing filtering: 42.8m (removed 103.7k)
-   📈 Saved: 06_stage6a_price_per_km.png
+   Saved: 06_stage6a_price_per_km.png
       Before: 42.9m records, range: 0.00–76822.98
       After:  42.8m records, range: 0.50–19.99
-   📈 Saved: 06_stage6b_price_per_min.png
+   Saved: 06_stage6b_price_per_min.png
       Before: 42.9m records, range: 0.00–14770.47
       After:  42.8m records, range: 0.50–37.59
 
 ====================================================================================================
-🎉 CLEANING SUMMARY
+CLEANING SUMMARY
 ====================================================================================================
 Original size (after loading):  46.0m
 Final size (after cleaning):    42.8m
@@ -79,7 +79,7 @@ Retained:                       93.1%
 Removed as outliers:            6.9%
 ====================================================================================================
 
-📊 POST-PROCESSED STATISTICS (After all 6 cleaning stages)
+POST-PROCESSED STATISTICS (After all 6 cleaning stages)
 ====================================================================================================
              Metric   Mean Median Std Dev    Min    Max
 Trip Duration (min)  11.51   9.92    7.14 0.0667  48.12
@@ -90,13 +90,12 @@ Trip Duration (min)  11.51   9.92    7.14 0.0667  48.12
       Price/min ($) 0.9931 0.9213  0.3369 0.5000  37.59
 Dataset size: 42.8m rows
 ====================================================================================================
+Saving to C:/Users/Anya/master_thesis/output\taxi_data_cleaned_full.parquet...
+Statistics saved to: C:/Users/Anya/master_thesis/output\cleaning_statistics.csv
+Comparison saved to: C:/Users/Anya/master_thesis/output\statistics_comparison.csv
+All files saved successfully.
 
-💾 Saving to C:/Users/Anya/master_thesis/output\taxi_data_cleaned_full.parquet...
-📊 Statistics saved to: C:/Users/Anya/master_thesis/output\cleaning_statistics.csv
-📊 Comparison saved to: C:/Users/Anya/master_thesis/output\statistics_comparison.csv
-✅ All files saved successfully.
-
-📁 Output files in: C:/Users/Anya/master_thesis/output
+Output files in: C:/Users/Anya/master_thesis/output
    • taxi_data_cleaned_full.parquet (main dataset)
    • cleaning_report.pkl (cleaning metadata)
    • robust_scaler.pkl (preprocessing scaler)
@@ -105,5 +104,5 @@ Dataset size: 42.8m rows
    • FOCUSED 2-boxplot PNG files per stage
 
 ====================================================================================================
-🎉 PIPELINE COMPLETE - Ready for clustering/analysis phase
+PIPELINE COMPLETE - Ready for clustering/analysis phase
 ====================================================================================================

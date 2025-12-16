@@ -32,6 +32,8 @@ from sklearn.metrics import (
 )
 from xgboost import XGBRegressor
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.decomposition import PCA
+from pca_visualizer import PCAVisualizer
 
 # Deep Learning
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Only show ERROR, skip WARNINGS
@@ -573,78 +575,101 @@ class XGBoostOptimizer:
 # ============================================================================
 
 
-class LSTMPredictor:
-    """LSTM encoder-decoder for sequence prediction"""
-
-    def __init__(self, n_features: int, n_lags: int = 24):
-        self.n_features = n_features
-        self.n_lags = n_lags
+class OptimizedLSTMForecaster:
+    def __init__(self, n_components=256, lstm_units=128):
+        self.n_components = n_components
+        self.lstm_units = lstm_units
+        self.pca = PCA(n_components=n_components)
+        self.scaler = StandardScaler()
         self.model = None
-        self.scaler = MinMaxScaler()
-        self.history = None
+        
+    def preprocess(self, X_train, X_test):
+        """Reduce dimensions and scale"""
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        X_train_reduced = self.pca.fit_transform(X_train_scaled)
+        X_test_reduced = self.pca.transform(X_test_scaled)
+        
+        print(f"[INFO] PCA Explained Variance: {self.pca.explained_variance_ratio_.sum():.4f}")
+        print(f"[INFO] Reduced dimensions: {X_train_reduced.shape}")
+        
+        return X_train_reduced, X_test_reduced
 
-    def create_sequences(self, data: np.ndarray, seq_length: int = 24):
-        """Create sequences for LSTM"""
-        X, y = [], []
-        for i in range(len(data) - seq_length):
-            X.append(data[i:i+seq_length])
-            y.append(data[i+seq_length])
-        return np.array(X), np.array(y)
+    def build_model(self, seqlength, outputdim):
+        """Build autoencoder-style LSTM for dimensionality-reduced forecasting"""
 
-    def build_model(self, units: list = [64, 32]):
-        """Build encoder-decoder LSTM"""
-        logger.info("Building LSTM encoder-decoder model...")
+        model = keras.Sequential([
+            # Encoder processes 256-dim PCA features
+            keras.layers.LSTM(self.lstm_units, return_sequences=True, 
+                            input_shape=(seqlength, self.n_components), recurrent_dropout=0.2),
+            keras.layers.Dropout(0.2),
+            keras.layers.LSTM(self.lstm_units // 2, return_sequences=False, recurrent_dropout=0.2),
+            keras.layers.Dropout(0.2),
 
-        inputs = keras.Input(shape=(self.n_lags, self.n_features))
+            # Decoder: expand from 256 to 533 zones
+            keras.layers.RepeatVector(seqlength),
+            keras.layers.TimeDistributed(keras.layers.Dense(64, activation='relu')),
+            keras.layers.TimeDistributed(keras.layers.Dense(outputdim))
+        ])
+        return model
 
-        # Encoder
-        encoded = Bidirectional(LSTM(units[0], activation='relu', return_sequences=True))(inputs)
-        encoded = Dropout(0.2)(encoded)
-        encoded = Bidirectional(LSTM(units[1], activation='relu'))(encoded)
-        encoded = Dropout(0.2)(encoded)
+    def fit(self, X_train_reduced, y_train, X_val_reduced, y_val, 
+            epochs=100, batch_size=16):
+        """Train with optimized settings"""
+        
+        try:
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+            print("[INFO] Mixed precision enabled")
+        except:
+            print("[WARNING] Mixed precision not available")
 
-        # Decoder
-        decoded = RepeatVector(1)(encoded)
-        decoded = LSTM(units[1], activation='relu', return_sequences=True)(decoded)
-        decoded = Dropout(0.2)(decoded)
-        decoded = LSTM(units[0], activation='relu', return_sequences=False)(decoded)
-        decoded = Dropout(0.2)(decoded)
+        # Calculate output dimensions from y_train
+        if isinstance(y_train, pd.DataFrame):
+            outputdim = y_train.shape[1]  # 533 zones
+        else:
+            outputdim = y_train.shape[1] if y_train.ndim > 1 else 1
 
-        outputs = Dense(self.n_features)(decoded)
-
-        self.model = keras.Model(inputs, outputs)
-        self.model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-
-        logger.info(f"[OK] LSTM model built: {self.model.count_params()} parameters")
-        return self.model
-
-    def fit(self, X_train: np.ndarray, epochs: int = 50, batch_size: int = 32):
-        """Fit LSTM encoder-decoder for multi-step forecasting"""
-        logger.info("Fitting LSTM for multi-step forecasting...")
-        progress.update(50, "Training LSTM encoder-decoder")
-
-        callbacks = [
-            EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001)
-        ]
-
-        # X_train shape: (num_sequences, 24, num_features)
-        # Target: predict next step(s) from last timestep
-        self.history = self.model.fit(
-            X_train,  # Keep ALL 24 timesteps (encoder input)
-            X_train[:, -1, :],  # Target: last timestep (decoder output)
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_split=0.2,
-            callbacks=callbacks,
-            verbose=0
+        self.model = self.build_model(
+            seqlength=X_train_reduced.shape[1], 
+            outputdim=outputdim 
         )
-
-        logger.info(f"[OK] LSTM encoder-decoder fitted. Final loss: {self.history.history['loss'][-1]:.4f}")
-
-    def predict(self, X):
-        """Generate predictions"""
-        return self.model.predict(X, verbose=0)
+        
+        self.model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss='mse',
+            metrics=['mae']
+        )
+        
+        history = self.model.fit(
+            X_train_reduced, y_train,
+            batch_size=batch_size,
+            epochs=epochs,
+            validation_data=(X_val_reduced, y_val),
+            callbacks=[
+                keras.callbacks.EarlyStopping(
+                    monitor='val_loss',
+                    patience=10,
+                    restore_best_weights=True,
+                    verbose=1
+                ),
+                keras.callbacks.ReduceLROnPlateau(
+                    monitor='val_loss',
+                    factor=0.5,
+                    patience=5,
+                    min_lr=1e-6,
+                    verbose=1
+                )
+            ],
+            verbose=1
+        )
+        
+        return history
+    
+    def predict(self, X_test_reduced):
+        """Make predictions"""
+        return self.model.predict(X_test_reduced)
 
 
 # ============================================================================
@@ -750,39 +775,60 @@ else:
     top_clusters = checkpoint_mgr.load_checkpoint('top_clusters')
     feature_cols = checkpoint_mgr.load_checkpoint('feature_cols')
 
+# Check if data is time-sorted
+print(demand_matrix.index.min(), "to", demand_matrix.index.max())
+print("Is sorted:", demand_matrix.index.is_monotonic_increasing)
 
 print("\n" + "="*80)
 print("STEP 3: SARIMA MODELS")
 print("="*80)
 
-
 if not checkpoint_mgr.is_complete('sarima_fitted'):
     sarima_models = {}
-    sarima_results = {}
-    fitted_sarima = []
+    fitted_sarima = {}  # Dictionary
     
     for idx, cluster in enumerate(top_clusters):
         progress.update(20 + (idx * 2), f"Fitting SARIMA for cluster {cluster}")
         
-        predictor = SARIMAPredictor(str(cluster))
-        results = predictor.fit(train_data[cluster])
-        
-        if results is not None:
-            sarima_models[str(cluster)] = predictor
-            fitted_sarima.append(cluster)
-            # Save individual SARIMA models
-            joblib.dump(results, os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl'))
+        try:
+            predictor = SARIMAPredictor(str(cluster))
+            results = predictor.fit(train_data[cluster])
+            
+            if results is not None:
+                sarima_models[str(cluster)] = predictor
+                fitted_sarima[str(cluster)] = results  # Store with cluster name as key
+                # Save individual SARIMA models
+                joblib.dump(results, os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl'))
+        except Exception as e:
+            logger.warning(f"[!] SARIMA fitting failed for {cluster}: {e}")
     
+    logger.info(f"[OK] SARIMA fitted for {len(fitted_sarima)} clusters")
     checkpoint_mgr.save_checkpoint('sarima_models', sarima_models)
     checkpoint_mgr.save_checkpoint('fitted_sarima', fitted_sarima)
     checkpoint_mgr.mark_complete('sarima_fitted')
     del train_data  # Release large time series
     gc.collect()
+
 else:
     print("[OK] SARIMA models already fitted (from checkpoint)")
     sarima_models = checkpoint_mgr.load_checkpoint('sarima_models')
     fitted_sarima = checkpoint_mgr.load_checkpoint('fitted_sarima')
-
+    
+    # Verify it's a dictionary
+    if isinstance(fitted_sarima, list):
+        logger.warning("[!] SARIMA loaded as list, converting to dictionary...")
+        fitted_sarima_dict = {}
+        for idx, cluster_name in enumerate(fitted_sarima):
+            if idx < len(sarima_models):
+                fitted_sarima_dict[str(cluster_name)] = sarima_models[str(cluster_name)]
+        fitted_sarima = fitted_sarima_dict
+        logger.info(f"[OK] Converted {len(fitted_sarima)} SARIMA models to dictionary")
+        checkpoint_mgr.save_checkpoint('fitted_sarima', fitted_sarima)
+    elif isinstance(fitted_sarima, dict):
+        logger.info(f"[OK] SARIMA is dictionary with {len(fitted_sarima)} models")
+    else:
+        logger.error(f"[!] Unknown SARIMA type: {type(fitted_sarima)}")
+        fitted_sarima = {}
 
 print("\n" + "="*80)
 print("STEP 4: XGBOOST WITH HYPERPARAMETER OPTIMIZATION")
@@ -819,22 +865,24 @@ else:
     xgb_optimizer = checkpoint_mgr.load_checkpoint('xgb_optimizer')
 
 
-# ============================================================================
-# FORCE RECOMPUTE FEATURE IMPORTANCE
-# ============================================================================
+# =========================================================================================================
+# FORCE RECOMPUTE FEATURE IMPORTANCE - comment out if needed to rerun when checkpoint is saved for XGboost
+# =========================================================================================================
 
-print("\n" + "="*80)
-print("RECOMPUTING FEATURE IMPORTANCE")
-print("="*80)
+# print("\n" + "="*80)
+# print("RECOMPUTING FEATURE IMPORTANCE")
+# print("="*80)
 
-logger.info("Forcing feature importance recomputation...")
-xgb_optimizer.compute_feature_importance(X_train, y_train)
+# logger.info("Forcing feature importance recomputation...")
+# xgb_optimizer.compute_feature_importance(X_train, y_train)
 
-# Save updated feature importance
-if xgb_optimizer.feature_importance:
-    importance_df = list(xgb_optimizer.feature_importance.values())[0]
-    importance_df.to_csv(os.path.join(RESULTS_DIR, 'feature_importance_updated.csv'), index=False)
-    logger.info("[OK] Updated feature importance saved to: feature_importance_updated.csv")
+# # Save updated feature importance
+# if xgb_optimizer.feature_importance:
+#     importance_df = list(xgb_optimizer.feature_importance.values())[0]
+#     importance_df.to_csv(os.path.join(RESULTS_DIR, 'feature_importance_updated.csv'), index=False)
+#     logger.info("[OK] Updated feature importance saved to: feature_importance_updated.csv")
+
+
 
 print("\n" + "="*80)
 print("STEP 5: LSTM MODELS")
@@ -844,38 +892,247 @@ print("="*80)
 if not checkpoint_mgr.is_complete('lstm_fitted'):
     logger.info("Building and fitting LSTM models...")
     
-    # Scale data for LSTM
-    scaler = MinMaxScaler()
     gc.collect()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
     
-    # Proper sequence creation to avoid data leakage
-    X_combined = np.vstack([X_train_scaled, X_test_scaled])
-    X_combined_lstm, _ = LSTMPredictor(X_train.shape[1]).create_sequences(X_combined, seq_length=24)
+    # Initialize optimized forecaster
+    lstm_forecaster = OptimizedLSTMForecaster(n_components=256, lstm_units=128)
     
-    # Split sequences properly
-    n_train_seq = len(X_train_scaled) - 24
-    X_train_lstm = X_combined_lstm[:n_train_seq]
-    X_test_lstm = X_combined_lstm[n_train_seq:]
+    # Preprocess: PCA reduction + scaling
+    logger.info("Preprocessing data with PCA...")
+    X_train_reduced, X_test_reduced = lstm_forecaster.preprocess(X_train, X_test)
     
-    logger.info(f"[OK] LSTM sequences created - Train: {X_train_lstm.shape}, Test: {X_test_lstm.shape}")
+    # Reshape for LSTM sequences (seq_length=24)
+    seq_length = 24
+    n_features_reduced = X_train_reduced.shape[1]
     
-    # Build LSTM
-    lstm_predictor = LSTMPredictor(n_features=X_train.shape[1], n_lags=24)
-    lstm_predictor.build_model(units=[64, 32])
-    lstm_predictor.scaler = scaler
+    # ============ CRITICAL: Align y_train with LSTM sequences ============
+    # Create sequences from X_train
+    n_train_samples = (len(X_train_reduced) // seq_length) * seq_length
+    X_train_lstm = X_train_reduced[:n_train_samples].reshape(-1, seq_length, n_features_reduced)
+    
+    # ALIGN y_train to match X_train_lstm shape
+    # y_train should have shape (n_sequences,) or (n_sequences, n_targets)
+    
+    if isinstance(y_train, pd.DataFrame):
+        y_train_aligned = y_train.iloc[:n_train_samples]
+        # Take the last value of each sequence (or aggregate appropriately)
+        y_train_lstm = y_train_aligned.values.reshape(-1, seq_length, y_train_aligned.shape[1])
+        # Take the last timestep as the target
+        y_train_lstm = y_train_lstm[:, -1, :]  # Shape: (n_sequences, n_targets)
+    elif isinstance(y_train, np.ndarray):
+        y_train_aligned = y_train[:n_train_samples]
+        if y_train_aligned.ndim == 1:
+            # If 1D, reshape to (n_sequences, seq_length) then take last
+            y_train_lstm = y_train_aligned.reshape(-1, seq_length)
+            y_train_lstm = y_train_lstm[:, -1]  # Shape: (n_sequences,)
+        else:
+            # If 2D, reshape to (n_sequences, seq_length, n_targets)
+            y_train_lstm = y_train_aligned.reshape(-1, seq_length, y_train_aligned.shape[1])
+            y_train_lstm = y_train_lstm[:, -1, :]  # Shape: (n_sequences, n_targets)
+    else:
+        raise ValueError(f"Unsupported y_train type: {type(y_train)}")
+    
+    logger.info(f"[OK] LSTM sequences created - Train X: {X_train_lstm.shape}, Train y: {y_train_lstm.shape}")
+    
+    # ====================================================================
+    
+    # Do the same for test data
+    n_test_samples = (len(X_test_reduced) // seq_length) * seq_length
+    X_test_lstm = X_test_reduced[:n_test_samples].reshape(-1, seq_length, n_features_reduced)
+    
+    if isinstance(y_test, pd.DataFrame):
+        y_test_aligned = y_test.iloc[:n_test_samples]
+        y_test_lstm = y_test_aligned.values.reshape(-1, seq_length, y_test_aligned.shape[1])
+        y_test_lstm = y_test_lstm[:, -1, :]
+    elif isinstance(y_test, np.ndarray):
+        y_test_aligned = y_test[:n_test_samples]
+        if y_test_aligned.ndim == 1:
+            y_test_lstm = y_test_aligned.reshape(-1, seq_length)
+            y_test_lstm = y_test_lstm[:, -1]
+        else:
+            y_test_lstm = y_test_aligned.reshape(-1, seq_length, y_test_aligned.shape[1])
+            y_test_lstm = y_test_lstm[:, -1, :]
+    
+    logger.info(f"[OK] LSTM test sequences - Test X: {X_test_lstm.shape}, Test y: {y_test_lstm.shape}")
+    
+    # Split for validation
+    val_split = 0.2
+    val_idx = int(len(X_train_lstm) * (1 - val_split))
+    
+    X_train_split = X_train_lstm[:val_idx]
+    y_train_split = y_train_lstm[:val_idx]
+    X_val_split = X_train_lstm[val_idx:]
+    y_val_split = y_train_lstm[val_idx:]
+    
+    logger.info(f"Train split: X {X_train_split.shape}, y {y_train_split.shape}")
+    logger.info(f"Val split: X {X_val_split.shape}, y {y_val_split.shape}")
     
     # Fit LSTM
-    lstm_predictor.fit(X_train_lstm, epochs=50, batch_size=32)
+    logger.info("Fitting LSTM encoder-decoder...")
+    history = lstm_forecaster.fit(
+        X_train_split, y_train_split,
+        X_val_split, y_val_split,
+        epochs=100,
+        batch_size=16
+    )
     
-    checkpoint_mgr.save_checkpoint('lstm_predictor', lstm_predictor)
-    checkpoint_mgr.save_checkpoint('scaler_lstm', scaler)
+    # Save checkpoints
+    checkpoint_mgr.save_checkpoint('lstm_forecaster', lstm_forecaster)
+    checkpoint_mgr.save_checkpoint('lstm_history', history.history if hasattr(history, 'history') else history)
     checkpoint_mgr.mark_complete('lstm_fitted')
+    
+    logger.info("[OK] LSTM training completed")
+
 else:
-    print("[OK] LSTM already fitted (from checkpoint)")
-    lstm_predictor = checkpoint_mgr.load_checkpoint('lstm_predictor')
-    scaler = checkpoint_mgr.load_checkpoint('scaler_lstm')
+    logger.info("[OK] LSTM already fitted (from checkpoint)")
+    try:
+        lstm_forecaster = checkpoint_mgr.load_checkpoint('lstm_forecaster')
+        
+        # Verify lstm_forecaster loaded correctly
+        if lstm_forecaster is None:
+            logger.warning("[!] LSTM checkpoint is None, will refit")
+            raise Exception("LSTM checkpoint corrupted")
+        
+        # Verify output dimension
+        if hasattr(lstm_forecaster, 'model') and lstm_forecaster.model is not None:
+            if lstm_forecaster.model.layers[-1].units != 256:
+                logger.warning("[!] LSTM output dimension mismatch, refitting...")
+                # Can't delete, so just skip loading
+                lstm_forecaster = None
+        else:
+            logger.warning("[!] LSTM model not found, refitting...")
+            lstm_forecaster = None
+            
+    except Exception as e:
+        logger.warning(f"[!] LSTM checkpoint error: {e}, will refit")
+        lstm_forecaster = None
+
+# If lstm_forecaster is None, refit it
+if lstm_forecaster is None:
+    logger.info("Refitting LSTM from scratch...")
+    logger.info("Building and fitting LSTM models...")
+    
+    gc.collect()
+    
+    # Initialize optimized forecaster
+    lstm_forecaster = OptimizedLSTMForecaster(n_components=256, lstm_units=128)
+    
+    # Preprocess: PCA reduction + scaling
+    logger.info("Preprocessing data with PCA...")
+    X_train_reduced, X_test_reduced = lstm_forecaster.preprocess(X_train, X_test)
+    
+    # Reshape for LSTM sequences (seq_length=24)
+    seq_length = 24
+    n_features_reduced = X_train_reduced.shape[1]
+    
+    # ============ CRITICAL: Align y_train with LSTM sequences ============
+    # Create sequences from X_train
+    n_train_samples = (len(X_train_reduced) // seq_length) * seq_length
+    X_train_lstm = X_train_reduced[:n_train_samples].reshape(-1, seq_length, n_features_reduced)
+    
+    # ALIGN y_train to match X_train_lstm shape
+    # y_train should have shape (n_sequences,) or (n_sequences, n_targets)
+    
+    if isinstance(y_train, pd.DataFrame):
+        y_train_aligned = y_train.iloc[:n_train_samples]
+        # Take the last value of each sequence (or aggregate appropriately)
+        y_train_lstm = y_train_aligned.values.reshape(-1, seq_length, y_train_aligned.shape[1])
+        # Take the last timestep as the target
+        y_train_lstm = y_train_lstm[:, -1, :]  # Shape: (n_sequences, n_targets)
+    elif isinstance(y_train, np.ndarray):
+        y_train_aligned = y_train[:n_train_samples]
+        if y_train_aligned.ndim == 1:
+            # If 1D, reshape to (n_sequences, seq_length) then take last
+            y_train_lstm = y_train_aligned.reshape(-1, seq_length)
+            y_train_lstm = y_train_lstm[:, -1]  # Shape: (n_sequences,)
+        else:
+            # If 2D, reshape to (n_sequences, seq_length, n_targets)
+            y_train_lstm = y_train_aligned.reshape(-1, seq_length, y_train_aligned.shape[1])
+            y_train_lstm = y_train_lstm[:, -1, :]  # Shape: (n_sequences, n_targets)
+    else:
+        raise ValueError(f"Unsupported y_train type: {type(y_train)}")
+    
+    logger.info(f"[OK] LSTM sequences created - Train X: {X_train_lstm.shape}, Train y: {y_train_lstm.shape}")
+    
+    # ====================================================================
+    
+    # Do the same for test data
+    n_test_samples = (len(X_test_reduced) // seq_length) * seq_length
+    X_test_lstm = X_test_reduced[:n_test_samples].reshape(-1, seq_length, n_features_reduced)
+    
+    if isinstance(y_test, pd.DataFrame):
+        y_test_aligned = y_test.iloc[:n_test_samples]
+        y_test_lstm = y_test_aligned.values.reshape(-1, seq_length, y_test_aligned.shape[1])
+        y_test_lstm = y_test_lstm[:, -1, :]
+    elif isinstance(y_test, np.ndarray):
+        y_test_aligned = y_test[:n_test_samples]
+        if y_test_aligned.ndim == 1:
+            y_test_lstm = y_test_aligned.reshape(-1, seq_length)
+            y_test_lstm = y_test_lstm[:, -1]
+        else:
+            y_test_lstm = y_test_aligned.reshape(-1, seq_length, y_test_aligned.shape[1])
+            y_test_lstm = y_test_lstm[:, -1, :]
+    
+    logger.info(f"[OK] LSTM test sequences - Test X: {X_test_lstm.shape}, Test y: {y_test_lstm.shape}")
+    
+    # Split for validation
+    val_split = 0.2
+    val_idx = int(len(X_train_lstm) * (1 - val_split))
+    
+    X_train_split = X_train_lstm[:val_idx]
+    y_train_split = y_train_lstm[:val_idx]
+    X_val_split = X_train_lstm[val_idx:]
+    y_val_split = y_train_lstm[val_idx:]
+    
+    logger.info(f"Train split: X {X_train_split.shape}, y {y_train_split.shape}")
+    logger.info(f"Val split: X {X_val_split.shape}, y {y_val_split.shape}")
+    
+    # Fit LSTM
+    logger.info("Fitting LSTM encoder-decoder...")
+    history = lstm_forecaster.fit(
+        X_train_split, y_train_split,
+        X_val_split, y_val_split,
+        epochs=100,
+        batch_size=16
+    )
+    
+    # Save checkpoints
+    checkpoint_mgr.save_checkpoint('lstm_forecaster', lstm_forecaster)
+    checkpoint_mgr.save_checkpoint('lstm_history', history.history if hasattr(history, 'history') else history)
+    checkpoint_mgr.mark_complete('lstm_fitted')
+    
+    logger.info("[OK] LSTM training completed")
+
+print("\n" + "="*80)
+print("STEP 5a: PCA")
+print("="*80)
+
+if not checkpoint_mgr.is_complete('pca_visualizations_created'):
+    logger.info("Generating PCA analysis visualizations...")
+    
+    # Reload LSTM forecaster to access PCA
+    lstm_forecaster = checkpoint_mgr.load_checkpoint('lstm_forecaster')
+    
+    # Recreate reduced features for shape information
+    X_train_scaled = lstm_forecaster.scaler.transform(X_train)
+    X_train_reduced = lstm_forecaster.pca.transform(X_train_scaled)
+    
+    from pca_visualizer import PCAVisualizer
+    
+    pca_viz = PCAVisualizer(
+        pca_model=lstm_forecaster.pca,
+        X_original_shape=X_train.shape,
+        X_reduced_shape=X_train_reduced.shape,
+        explained_variance_ratio=lstm_forecaster.pca.explained_variance_ratio_,
+        output_dir='./outpu/models_upd/visualizations/'
+    )
+    
+    pca_viz.generate_all()
+    checkpoint_mgr.mark_complete('pca_visualizations_created')
+    logger.info("[OK] PCA visualizations generated")
+    
+else:
+    logger.info("[OK] PCA visualizations already created (from checkpoint)")
 
 
 print("\n" + "="*80)
@@ -886,62 +1143,87 @@ print("="*80)
 if not checkpoint_mgr.is_complete('models_evaluated'):
     progress.update(70, "Evaluating all models")
     
+    logger.info("="*80)
+    logger.info("STEP 6: MODEL EVALUATION (SARIMA + XGBoost + LSTM)")
+    logger.info("="*80)
+    
     # XGBoost predictions
     xgb_predictions = xgb_optimizer.predict(X_test)
     
-    # SARIMA with rolling forecast
+    # ============ SARIMA PREDICTIONS (FIXED) ============
+    logger.info("Making SARIMA predictions (using pre-fitted models)...")
+    logger.info(f"Note: Using multi-step forecast without refitting")
+    
     sarima_predictions = {}
-    for cluster in fitted_sarima:
+    
+    # Verify fitted_sarima is dictionary
+    if not isinstance(fitted_sarima, dict):
+        logger.error("[!] fitted_sarima is not a dictionary, cannot proceed")
+        logger.error(f"Type: {type(fitted_sarima)}")
+        fitted_sarima = {}
+    
+    logger.info(f"Processing {len(fitted_sarima)} SARIMA models...")
+    
+    for cluster_idx, (cluster_name, sarima_results) in enumerate(fitted_sarima.items()):
         try:
-            preds = []
-            history = pd.Series(train_data[cluster].values, index=train_data.index)
+            # sarima_results is the fitted SARIMAX results object
+            # Get multi-step ahead forecast
+            forecast_result = sarima_results.get_forecast(steps=len(test_data))
+            preds = forecast_result.predicted_mean.values
             
-            for t in range(len(test_data)):
-                try:
-                    model_refit = SARIMAX(
-                        history, 
-                        order=(1,1,1), 
-                        seasonal_order=(1,1,1,24),
-                        enforce_stationarity=False, 
-                        enforce_invertibility=False
-                    )
-                    results_refit = model_refit.fit(disp=False, maxiter=200)
-                    
-                    fc = results_refit.get_forecast(steps=1).predicted_mean.values
-                    preds.append(fc[0])
-                    
-                    new_idx = test_data.index[t]
-                    history = pd.concat([history, pd.Series([test_data[cluster].iloc[t]], index=[new_idx])])
-                    
-                except Exception as e_inner:
-                    logger.warning(f"[!] SARIMA refit failed at step {t} for {cluster}: {e_inner}")
-                    preds.append(np.nan)
+            sarima_predictions[cluster_name] = preds
             
-            sarima_predictions[cluster] = np.array(preds)
-            logger.info(f"[OK] SARIMA rolling forecast (with refitting) completed for {cluster}")
+            if (cluster_idx + 1) % 50 == 0:
+                logger.info(f"  [{cluster_idx + 1}/{len(fitted_sarima)}] SARIMA forecasts completed")
+            
         except Exception as e:
-            logger.warning(f"[!] SARIMA forecast failed for cluster {cluster}: {e}")
+            logger.warning(f"[!] SARIMA forecast failed for {cluster_name}: {type(e).__name__}: {e}")
+            sarima_predictions[cluster_name] = np.full(len(test_data), np.nan)
     
-    # LSTM predictions with proper inverse transform
-    X_test_scaled = scaler.transform(X_test)
-    X_test_lstm, _ = lstm_predictor.create_sequences(X_test_scaled, seq_length=24)
-    lstm_pred = lstm_predictor.predict(X_test_lstm)
+    logger.info(f"[OK] SARIMA predictions completed for {len(sarima_predictions)} clusters")
+    # =====================================================
     
-    # Correct inverse transform
-    dummy = np.zeros((lstm_pred.shape[0], X_test.shape[1]))
-    dummy[:, :lstm_pred.shape[1]] = lstm_pred
-    lstm_predictions_full = scaler.inverse_transform(dummy)
+    # ============ LSTM PREDICTIONS ============
+    logger.info("Making LSTM predictions...")
+    
+    lstm_forecaster = checkpoint_mgr.load_checkpoint('lstm_forecaster')
+    
+    X_test_scaled = lstm_forecaster.scaler.transform(X_test)
+    X_test_reduced = lstm_forecaster.pca.transform(X_test_scaled)
+    
+    seq_length = 24
+    n_features_reduced = X_test_reduced.shape[1]
+    
+    n_test_samples = (len(X_test_reduced) // seq_length) * seq_length
+    X_test_lstm = X_test_reduced[:n_test_samples].reshape(-1, seq_length, n_features_reduced)
+    
+    logger.info(f"[OK] LSTM test sequences shaped: {X_test_lstm.shape}")
+    
+    lstm_pred = lstm_forecaster.predict(X_test_lstm)
+    logger.info(f"[OK] LSTM raw predictions shape: {lstm_pred.shape}")
+    
+    # Inverse transform
+    lstm_pred_full_dims = lstm_forecaster.pca.inverse_transform(lstm_pred)
+    
+    dummy = np.zeros((lstm_pred_full_dims.shape[0], X_test.shape[1]))
+    dummy[:, :lstm_pred_full_dims.shape[1]] = lstm_pred_full_dims
+    lstm_predictions_full = lstm_forecaster.scaler.inverse_transform(dummy)
+    
     lstm_predictions = lstm_predictions_full[:, :lstm_pred.shape[1]]
     
+    logger.info(f"[OK] LSTM predictions after inverse transform: {lstm_predictions.shape}")
+    # =========================================
+    
     # Ensure alignment between predictions and actual values
-    common_clusters = list(set(top_clusters) & set(y_test.columns) & set(xgb_predictions.columns))
-    logger.info(f"Evaluating {len(common_clusters)} common clusters")
+    common_clusters = list(set(top_clusters) & set(y_test.columns) & set(xgb_predictions.columns) & set(sarima_predictions.keys()))
+    logger.info(f"Evaluating {len(common_clusters)} common clusters (SARIMA + XGBoost + LSTM)")
     
     # Calculate metrics for all models
     metrics_results = {}
     
-    for cluster in common_clusters:
-        actual = y_test[cluster].values
+    for cluster_idx, cluster in enumerate(common_clusters):
+        actual_full = y_test[cluster].values
+        actual = actual_full[:n_test_samples]
         
         metrics_results[cluster] = {
             'SARIMA': {},
@@ -949,39 +1231,76 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
             'LSTM': {}
         }
         
-        # XGBoost metrics
-        xgb_pred = xgb_predictions[cluster].values[:len(actual)]
-        metrics_results[cluster]['XGBoost'] = {
-            'RMSE': np.sqrt(mean_squared_error(actual, xgb_pred)),
-            'MAE': mean_absolute_error(actual, xgb_pred),
-            'MAPE': calculate_mape(actual, xgb_pred),  # FIX #7: Use helper function
-            'R2': r2_score(actual, xgb_pred)
-        }
+        # ===== XGBoost metrics =====
+        try:
+            xgb_pred = xgb_predictions[cluster].values[:len(actual)]
+            valid_idx = ~(np.isnan(xgb_pred) | np.isinf(xgb_pred) | np.isnan(actual) | np.isinf(actual))
+            
+            if valid_idx.sum() > 0:
+                metrics_results[cluster]['XGBoost'] = {
+                    'RMSE': np.sqrt(mean_squared_error(actual[valid_idx], xgb_pred[valid_idx])),
+                    'MAE': mean_absolute_error(actual[valid_idx], xgb_pred[valid_idx]),
+                    'MAPE': calculate_mape(actual[valid_idx], xgb_pred[valid_idx]),
+                    'R2': r2_score(actual[valid_idx], xgb_pred[valid_idx])
+                }
+        except Exception as e:
+            logger.warning(f"[!] XGBoost metrics failed for {cluster}: {e}")
         
-        # SARIMA metrics
-        if cluster in sarima_predictions:
-            sarima_pred = sarima_predictions[cluster][:len(actual)]
-            metrics_results[cluster]['SARIMA'] = {
-                'RMSE': np.sqrt(mean_squared_error(actual, sarima_pred)),
-                'MAE': mean_absolute_error(actual, sarima_pred),
-                'MAPE': calculate_mape(actual, sarima_pred),  # FIX #7
-                'R2': r2_score(actual, sarima_pred)
-            }
+        # ===== SARIMA metrics =====
+        try:
+            if cluster in sarima_predictions:
+                sarima_pred = sarima_predictions[cluster][:len(actual)]
+                valid_idx = ~(np.isnan(sarima_pred) | np.isinf(sarima_pred) | np.isnan(actual) | np.isinf(actual))
+                
+                if valid_idx.sum() > 0:
+                    metrics_results[cluster]['SARIMA'] = {
+                        'RMSE': np.sqrt(mean_squared_error(actual[valid_idx], sarima_pred[valid_idx])),
+                        'MAE': mean_absolute_error(actual[valid_idx], sarima_pred[valid_idx]),
+                        'MAPE': calculate_mape(actual[valid_idx], sarima_pred[valid_idx]),
+                        'R2': r2_score(actual[valid_idx], sarima_pred[valid_idx])
+                    }
+                else:
+                    logger.warning(f"[!] SARIMA has only NaN/inf predictions for {cluster}")
+        except Exception as e:
+            logger.warning(f"[!] SARIMA metrics failed for {cluster}: {e}")
         
-        logger.info(f"\nCluster {cluster}:")
-        logger.info(f"  XGBoost - RMSE: {metrics_results[cluster]['XGBoost']['RMSE']:.4f}")
-        if cluster in sarima_predictions:
-            logger.info(f"  SARIMA  - RMSE: {metrics_results[cluster]['SARIMA']['RMSE']:.4f}")
+        # ===== LSTM metrics =====
+        try:
+            if cluster < lstm_predictions.shape[1]:
+                lstm_pred_cluster = lstm_predictions[:len(actual), cluster]
+                valid_idx = ~(np.isnan(lstm_pred_cluster) | np.isinf(lstm_pred_cluster) | np.isnan(actual) | np.isinf(actual))
+                
+                if valid_idx.sum() > 0:
+                    metrics_results[cluster]['LSTM'] = {
+                        'RMSE': np.sqrt(mean_squared_error(actual[valid_idx], lstm_pred_cluster[valid_idx])),
+                        'MAE': mean_absolute_error(actual[valid_idx], lstm_pred_cluster[valid_idx]),
+                        'MAPE': calculate_mape(actual[valid_idx], lstm_pred_cluster[valid_idx]),
+                        'R2': r2_score(actual[valid_idx], lstm_pred_cluster[valid_idx])
+                    }
+        except Exception as e:
+            logger.warning(f"[!] LSTM metrics failed for {cluster}: {e}")
+        
+        if (cluster_idx + 1) % 50 == 0:
+            logger.info(f"  [{cluster_idx + 1}/{len(common_clusters)}] Metrics calculated")
     
+    # Save checkpoints
+    checkpoint_mgr.save_checkpoint('lstm_forecaster', lstm_forecaster)
     checkpoint_mgr.save_checkpoint('metrics_results', metrics_results)
     checkpoint_mgr.save_checkpoint('xgb_predictions', xgb_predictions)
     checkpoint_mgr.save_checkpoint('sarima_predictions', sarima_predictions)
     checkpoint_mgr.save_checkpoint('lstm_predictions', lstm_predictions)
     checkpoint_mgr.mark_complete('models_evaluated')
-    del sarima_models
+    del sarima_results
     gc.collect()
+    
+    logger.info("\n" + "="*80)
+    logger.info("[OK] Model evaluation completed successfully")
+    logger.info(f"Total clusters evaluated: {len(common_clusters)}")
+    logger.info("="*80 + "\n")
+
 else:
-    print("[OK] Models already evaluated (from checkpoint)")
+    logger.info("[OK] Models already evaluated (from checkpoint)")
+    lstm_forecaster = checkpoint_mgr.load_checkpoint('lstm_forecaster')
     metrics_results = checkpoint_mgr.load_checkpoint('metrics_results')
     xgb_predictions = checkpoint_mgr.load_checkpoint('xgb_predictions')
     sarima_predictions = checkpoint_mgr.load_checkpoint('sarima_predictions')
