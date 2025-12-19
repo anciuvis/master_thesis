@@ -10,4 +10,4 @@ pip install -r requirements.txt
 - C_00_demand_analysis.py - Demand distribution analysis & tier classification
 - C_01_1_hierarchical_clustering.py - Spatiotemporal clustering with K-Means and HDBSCAN
 - C_01_2_cleanup_checkpoints.py - Checkpoint management utility (if needed to delete checkpoint and start from scratch)
-- C_02_1_pipeline_upd.py - SARIMA + XGBoost + LSTM forecasting models
+- C_02_1_forecasting_pipeline.py - SARIMA + XGBoost + LSTM forecasting models

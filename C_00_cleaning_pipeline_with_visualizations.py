@@ -212,11 +212,10 @@ def safe_histogram(ax, data, title, bins=100, color='steelblue', xlabel='Value')
     ax.set_xlim(left=0, right=p95)
 
     ax.set_title(f'{title} - Min: {data_clean.min():.2f}, Max: {data_clean.max():.2f}, P95: {p95:.2f}',
-                 fontweight='bold', fontsize=8.5, pad=2, linespacing=1.0)
-    ax.set_xlabel(xlabel, fontsize=8, loc='right')
-    ax.set_ylabel('Frequency', fontsize=8)
-    ax.legend(fontsize=8.5, loc='upper right')
-    ax.margins(x=0.02, y=0.05)
+                 fontweight='bold', fontsize=12, pad=4, linespacing=1.0)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.legend(fontsize=12, loc='upper right')
+    ax.margins(x=0.02, y=0.08)
 
 
 def visualize_feature_distributions(df, output_path, stage="raw", orientation='horizontal'):

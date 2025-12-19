@@ -327,7 +327,7 @@ class SARIMAPredictor:
         self.fitted = False
         self.train_data = None
     
-    def fit(self, train_data: pd.Series, order=(1,1,1), seasonal_order=(1,1,1,24)):
+    def fit(self, train_data: pd.Series, order=(1,1,1), seasonal_order=(1,1,1,168)):
         """Fit SARIMA model"""
         try:
             self.train_data = train_data.copy()
