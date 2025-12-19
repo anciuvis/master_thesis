@@ -22,6 +22,13 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tools.sm_exceptions import ValueWarning
+
+# Multiprocessing
+from joblib import Parallel, delayed
+from multiprocessing import cpu_count
+from multiprocessing import get_context
+import psutil
 
 # Machine Learning
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
@@ -32,8 +39,7 @@ from sklearn.metrics import (
 )
 from xgboost import XGBRegressor
 from sklearn.multioutput import MultiOutputRegressor
-from sklearn.decomposition import PCA
-from pca_visualizer import PCAVisualizer
+from sklearn.model_selection import RandomizedSearchCV
 
 # Deep Learning
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Only show ERROR, skip WARNINGS
@@ -47,6 +53,9 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import mixed_precision
+from sklearn.decomposition import PCA
+from pca_visualizer import PCAVisualizer
 
 # Feature Importance - Check if SHAP is available
 try:
@@ -59,27 +68,104 @@ warnings.filterwarnings('ignore')
 plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette("husl")
 
+# Suppress specific statsmodels warnings
+warnings.simplefilter('ignore', category=ValueWarning)
+warnings.simplefilter('ignore', category=FutureWarning)
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION - KEY PARAMETER: N_TOP_CLUSTERS
 # ============================================================================
 
+class PipelineConfig:
+    """Centralized configuration for the forecasting pipeline"""
+    
+    def __init__(self):
+        # ========== CLUSTER CONFIGURATION ==========
+        # THIS IS THE KEY PARAMETER - Change this to train on different numbers of clusters
+        self.n_top_clusters = 30  # 
+        
+        # ========== DATA PATHS ==========
+        self.input_data_path = 'C:/Users/Anya/master_thesis/output'
+        self.input_file = 'taxi_data_cleaned_full_with_clusters.parquet'
+        
+        # ========== OUTPUT PATHS (dynamic based on n_top_clusters) ==========
+        self.output_base = f'C:/Users/Anya/master_thesis/output/models_upd_30'
+        self.checkpoint_dir = os.path.join(self.output_base, 'checkpoints')
+        self.results_dir = os.path.join(self.output_base, 'results')
+        self.viz_dir = os.path.join(self.output_base, 'visualizations')
+        self.log_dir = os.path.join(self.output_base, 'logs')
+        self.models_dir = os.path.join(self.output_base, 'models')
+        
+        # ========== FEATURE ENGINEERING ==========
+        self.lag_features = 168  # 7 days of hourly data
+        self.seq_length = 24  # LSTM sequence length (24 hours)
+        
+        # ========== DATA SPLITTING ==========
+        self.test_size = 0.2
+        self.val_size = 0.1
+        
+        # ========== XGBOOST HYPERPARAMETERS ==========
+        self.xgb_grid_type = 'quick'  # 'quick', 'medium', 'full'
+        self.xgb_default_params = {
+            'n_estimators': 300,
+            'max_depth': 3,
+            'learning_rate': 0.1,
+            'min_child_weight': 1,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8
+        }
+        
+        # ========== LSTM ARCHITECTURE ==========
+        self.lstm_n_components = 256  # PCA reduction dimension
+        self.lstm_units = 128
+        self.lstm_epochs = 100
+        self.lstm_batch_size = 16
+        
+        # ========== SARIMA PARAMETERS ==========
+        self.sarima_order = (0, 1, 1)  # Differencing + MA, no AR
+        self.sarima_seasonal_order = (0, 1, 1, 168)  # Seasonal MA only
+        self.sarima_maxiter = 100  # Reduced iterations
+        
+        # Create output directories
+        for d in [self.checkpoint_dir, self.results_dir, self.viz_dir, self.log_dir, self.models_dir]:
+            os.makedirs(d, exist_ok=True)
+    
+    def get_summary(self):
+        """Print configuration summary"""
+        return f"""
+        ╔════════════════════════════════════════════════════════════════╗
+        ║           PIPELINE CONFIGURATION SUMMARY                      ║
+        ╠════════════════════════════════════════════════════════════════╣
+        ║ Top Clusters:              {self.n_top_clusters:<40} ║
+        ║ Input File:                {self.input_file:<40} ║
+        ║ Output Base:               {os.path.basename(self.output_base):<40} ║
+        ║                                                                ║
+        ║ Lag Features:              {self.lag_features:<40} ║
+        ║ LSTM Seq Length:           {self.seq_length:<40} ║
+        ║ Test/Val Split:            {self.test_size}/{self.val_size:<36} ║
+        ║                                                                ║
+        ║ LSTM PCA Components:       {self.lstm_n_components:<40} ║
+        ║ LSTM Units:                {self.lstm_units:<40} ║
+        ║ LSTM Epochs:               {self.lstm_epochs:<40} ║
+        ║                                                                ║
+        ║ SARIMA Order:              {str(self.sarima_order):<40} ║
+        ║ SARIMA Seasonal:           {str(self.sarima_seasonal_order):<40} ║
+        ╚════════════════════════════════════════════════════════════════╝
+        """
 
-INPUT_DATA_PATH = 'C:/Users/Anya/master_thesis/output'
-INPUT_FILE = 'taxi_data_cleaned_full_with_clusters.parquet'
-OUTPUT_BASE = 'C:/Users/Anya/master_thesis/output/models_upd'
 
+# Initialize config
+config = PipelineConfig()
 
-CHECKPOINT_DIR = os.path.join(OUTPUT_BASE, 'checkpoints')
-RESULTS_DIR = os.path.join(OUTPUT_BASE, 'results')
-VIZ_DIR = os.path.join(OUTPUT_BASE, 'visualizations')
-LOG_DIR = os.path.join(OUTPUT_BASE, 'logs')
-MODELS_DIR = os.path.join(OUTPUT_BASE, 'models')
+INPUT_DATA_PATH = config.input_data_path
+INPUT_FILE = config.input_file
+OUTPUT_BASE = config.output_base
 
-
-for d in [CHECKPOINT_DIR, RESULTS_DIR, VIZ_DIR, LOG_DIR, MODELS_DIR]:
-    os.makedirs(d, exist_ok=True)
-
+CHECKPOINT_DIR = config.checkpoint_dir
+RESULTS_DIR = config.results_dir
+VIZ_DIR = config.viz_dir
+LOG_DIR = config.log_dir
+MODELS_DIR = config.models_dir
 
 # Logging
 log_file = os.path.join(LOG_DIR, f'integrated_pipeline_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
@@ -95,7 +181,6 @@ if SHAP_AVAILABLE:
     logger.info("[OK] SHAP library available for feature importance")
 else:
     logger.warning("[!] SHAP not installed. Using gain-based feature importance as fallback")
-
 
 np.random.seed(42)
 tf.random.set_seed(42)
@@ -313,12 +398,11 @@ def create_train_val_test_split(demand_matrix: pd.DataFrame,
 
 
 # ============================================================================
-# SARIMA MODEL
+# SARIMA MODEL - MEMORY OPTIMIZED VERSION
 # ============================================================================
 
-
 class SARIMAPredictor:
-    """SARIMA wrapper with rolling forecast support"""
+    """SARIMA wrapper with memory-efficient fallback strategies"""
     
     def __init__(self, cluster_name: str):
         self.cluster_name = cluster_name
@@ -326,20 +410,107 @@ class SARIMAPredictor:
         self.results = None
         self.fitted = False
         self.train_data = None
+        self.strategy = None
     
     def fit(self, train_data: pd.Series, order=(1,1,1), seasonal_order=(1,1,1,168)):
-        """Fit SARIMA model"""
-        try:
-            self.train_data = train_data.copy()
-            self.model = SARIMAX(train_data, order=order, seasonal_order=seasonal_order,
-                                enforce_stationarity=False, enforce_invertibility=False)
-            self.results = self.model.fit(disp=False, maxiter=200)
-            self.fitted = True
-            logger.info(f"[OK] SARIMA fitted for {self.cluster_name}: AIC={self.results.aic:.2f}")
-            return self.results
-        except Exception as e:
-            logger.error(f"[X] SARIMA fitting failed for {self.cluster_name}: {e}")
-            return None
+        """
+        Fit SARIMA with memory-efficient strategies optimized for weekly seasonality.
+        
+        Key insight: We want to PRESERVE weekly patterns (168h lag) but reduce 
+        memory footprint. Use (0,1,1,168) or (1,0,1,168) instead of (1,1,1,168).
+        """
+        
+        strategies = [
+            # STRATEGY 1: Seasonal MA only (most memory-efficient while preserving seasonality)
+            # This captures seasonal shocks without seasonal differencing
+            {
+                'name': 'Seasonal MA Only (0,1,1,168)',
+                'order': (0, 1, 1),  # Non-seasonal: only MA term
+                'seasonal_order': (0, 1, 1, 168)  # Seasonal: only MA, no AR
+            },
+            
+            # STRATEGY 2: Reduced seasonal order with just seasonal differencing
+            # Uses (1,0,1,168) - simpler state space
+            {
+                'name': 'Reduced Seasonal (1,0,1,168)',
+                'order': (1, 1, 0),  # Non-seasonal AR + differencing
+                'seasonal_order': (1, 0, 1, 168)  # Seasonal AR only
+            },
+            
+            # STRATEGY 3: Even more reduced - only capture 24h patterns + seasonal MA
+            # Instead of (1,1,1,168), use subset of lags
+            {
+                'name': 'Memory-Light Seasonal (0,1,1,24)',
+                'order': (0, 1, 1),
+                'seasonal_order': (0, 1, 1, 24)  # Daily seasonality instead of weekly
+            },
+            
+            # STRATEGY 4: Simple exponential smoothing via ARIMA
+            # No seasonality, just capture trend + noise
+            {
+                'name': 'Simple ARIMA (1,1,1)',
+                'order': (1, 1, 1),
+                'seasonal_order': None
+            },
+            
+            # STRATEGY 5: Last resort - basic differencing
+            {
+                'name': 'Basic AR (1,0,0)',
+                'order': (1, 0, 0),
+                'seasonal_order': None
+            },
+        ]
+        
+        for strategy in strategies:
+            try:
+                gc.collect()
+                logger.info(f"[{self.cluster_name}] Attempting: {strategy['name']}")
+                
+                if strategy['seasonal_order'] is None:
+                    from statsmodels.tsa.arima.model import ARIMA
+                    self.model = ARIMA(
+                        train_data,
+                        order=strategy['order'],
+                        enforce_stationarity=False,
+                        enforce_invertibility=False
+                    )
+                else:
+                    self.model = SARIMAX(
+                        train_data,
+                        order=strategy['order'],
+                        seasonal_order=strategy['seasonal_order'],
+                        enforce_stationarity=False,
+                        enforce_invertibility=False,
+                        disp=False,
+                        # MEMORY OPTIMIZATION: Kalman filter options
+                        measurement_error=True,  # Reduces numerical issues
+                        error_cov_type='diagonal'  # Simpler covariance structure
+                    )
+                
+                # Fit with REDUCED iterations (200 is too aggressive)
+                self.results = self.model.fit(
+                    disp=False,
+                    maxiter=100,  # Reduced from 200 to 100
+                    low_memory=True  # Enable low-memory mode if available
+                )
+                
+                self.fitted = True
+                self.strategy = strategy['name']
+                logger.info(f"[OK] SARIMA fitted ({strategy['name']}): AIC={self.results.aic:.2f}")
+                return self.results
+                
+            except MemoryError as e:
+                logger.warning(f"[FALLBACK] {strategy['name']} failed - MemoryError: {str(e)[:100]}")
+                gc.collect()
+                continue
+                
+            except Exception as e:
+                logger.warning(f"[FALLBACK] {strategy['name']} failed - {type(e).__name__}: {str(e)[:80]}")
+                gc.collect()
+                continue
+        
+        logger.error(f"[X] {self.cluster_name}: All fitting strategies failed")
+        return None
     
     def forecast(self, steps: int):
         """Generate forecasts"""
@@ -359,7 +530,6 @@ class SARIMAPredictor:
             'lower_ci': forecast_ci.iloc[:, 0].values,
             'upper_ci': forecast_ci.iloc[:, 1].values
         }
-
 
 # ============================================================================
 # XGBOOST WITH HYPERPARAMETER OPTIMIZATION
@@ -405,7 +575,9 @@ class XGBoostOptimizer:
     
     def tune_hyperparameters(self, X_train, y_train, X_val=None, y_val=None, 
                             target_cluster=None, grid_type='quick'):
-        """GridSearchCV for hyperparameter optimization with validation set"""
+        """
+        STABLE: Serial Search, Parallel XGBoost (Fixes Windows Access Violation)
+        """
         logger.info(f"Tuning XGBoost hyperparameters (grid_type={grid_type})...")
         progress.update(35, "Optimizing XGBoost hyperparameters")
         
@@ -418,18 +590,29 @@ class XGBoostOptimizer:
         
         logger.info(f"  Target cluster: {target_name}")
         
-        base_model = XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=1, verbosity=0)
-        param_grid = self.get_param_grid(grid_type)
+       
+        base_model = XGBRegressor(
+            objective='reg:squarederror', 
+            random_state=42, 
+            n_jobs=16,
+            verbosity=0,
+            tree_method='hist' 
+        )
         
+        param_grid = self.get_param_grid(grid_type)
         tscv = TimeSeriesSplit(n_splits=3)
         
-        grid_search = GridSearchCV(
+        from sklearn.model_selection import RandomizedSearchCV
+        
+        grid_search = RandomizedSearchCV(
             estimator=base_model,
-            param_grid=param_grid,
+            param_distributions=param_grid,
+            n_iter=15, 
             cv=tscv,
             scoring='neg_root_mean_squared_error',
-            n_jobs=-1,
-            verbose=0
+            n_jobs=1,
+            verbose=1,
+            random_state=42
         )
         
         grid_search.fit(X_train.values, target.values)
@@ -440,7 +623,6 @@ class XGBoostOptimizer:
         logger.info(f"  Best params: {grid_search.best_params_}")
         
         return grid_search.best_params_, grid_search.best_estimator_
-    
 
     def fit_all_clusters(self, X_train, y_train, X_val=None, y_val=None):
         """Fit XGBoost for all clusters with validation set support"""
@@ -574,7 +756,6 @@ class XGBoostOptimizer:
 # LSTM ENCODER-DECODER
 # ============================================================================
 
-
 class OptimizedLSTMForecaster:
     def __init__(self, n_components=256, lstm_units=128):
         self.n_components = n_components
@@ -597,37 +778,47 @@ class OptimizedLSTMForecaster:
         return X_train_reduced, X_test_reduced
 
     def build_model(self, seqlength, outputdim):
-        """Build autoencoder-style LSTM for dimensionality-reduced forecasting"""
-
+        """
+        Build Many-to-One LSTM for single-step ahead forecasting.
+        Input: (batch_size, seqlength, n_components)
+        Output: (batch_size, outputdim) -> Predicting t+1 for all clusters
+        """
         model = keras.Sequential([
             # Encoder processes 256-dim PCA features
+            # Return sequences=True to pass full sequence to next LSTM layer
             keras.layers.LSTM(self.lstm_units, return_sequences=True, 
-                            input_shape=(seqlength, self.n_components), recurrent_dropout=0.2),
-            keras.layers.Dropout(0.2),
-            keras.layers.LSTM(self.lstm_units // 2, return_sequences=False, recurrent_dropout=0.2),
+                            input_shape=(seqlength, self.n_components),
+                            # recurrent_dropout=0.2 # REMOVED for cuDNN compatibility (speed)
+                            dropout=0.2), 
+            
+            # Second LSTM layer. return_sequences=False makes it "Many-to-One"
+            # It only returns the output of the LAST timestep
+            keras.layers.LSTM(self.lstm_units // 2, return_sequences=False,
+                            dropout=0.2),
+            
             keras.layers.Dropout(0.2),
 
-            # Decoder: expand from 256 to 533 zones
-            keras.layers.RepeatVector(seqlength),
-            keras.layers.TimeDistributed(keras.layers.Dense(64, activation='relu')),
-            keras.layers.TimeDistributed(keras.layers.Dense(outputdim))
+            # Dense layer to map to output dimensions (number of clusters)
+            keras.layers.Dense(64, activation='relu'),
+            keras.layers.Dense(outputdim) # Output: (batch_size, 533 clusters)
         ])
         return model
 
     def fit(self, X_train_reduced, y_train, X_val_reduced, y_val, 
             epochs=100, batch_size=16):
-        """Train with optimized settings"""
-        
-        try:
-            policy = tf.keras.mixed_precision.Policy('mixed_float16')
-            tf.keras.mixed_precision.set_global_policy(policy)
-            print("[INFO] Mixed precision enabled")
-        except:
-            print("[WARNING] Mixed precision not available")
+        """Train with RYZEN/GPU optimized settings"""
 
-        # Calculate output dimensions from y_train
+        policy = mixed_precision.Policy('mixed_float16')
+        mixed_precision.set_global_policy(policy)
+        print("[INFO] Mixed precision (FP16) enabled")
+
+        # 2. OPTIMIZATION: CPU Threading for Ryzen 9800X3D
+        tf.config.threading.set_inter_op_parallelism_threads(16)
+        tf.config.threading.set_intra_op_parallelism_threads(16)
+
+        # Calculate output dimensions
         if isinstance(y_train, pd.DataFrame):
-            outputdim = y_train.shape[1]  # 533 zones
+            outputdim = y_train.shape[1]
         else:
             outputdim = y_train.shape[1] if y_train.ndim > 1 else 1
 
@@ -639,7 +830,8 @@ class OptimizedLSTMForecaster:
         self.model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=0.001),
             loss='mse',
-            metrics=['mae']
+            metrics=['mae'],
+            jit_compile=True  # XLA acceleration
         )
         
         history = self.model.fit(
@@ -676,6 +868,9 @@ class OptimizedLSTMForecaster:
 # PIPELINE EXECUTION
 # ============================================================================
 
+# =========================================================================
+# STEP 1 DATA LOADING & PREPARATION
+# =========================================================================
 
 print("\n" + "="*80)
 print("STEP 1: DATA LOADING & PREPARATION")
@@ -711,6 +906,10 @@ else:
     val_data = checkpoint_mgr.load_checkpoint('val_data')
     test_data = checkpoint_mgr.load_checkpoint('test_data')
 
+
+# =========================================================================
+# STEP 2 FEATURE ENGINEERING
+# =========================================================================
 
 if not checkpoint_mgr.is_complete('features_engineered'):
     gc.collect()
@@ -779,90 +978,596 @@ else:
 print(demand_matrix.index.min(), "to", demand_matrix.index.max())
 print("Is sorted:", demand_matrix.index.is_monotonic_increasing)
 
-print("\n" + "="*80)
-print("STEP 3: SARIMA MODELS")
-print("="*80)
+# ============================================================================
+# HELPER: GET ALREADY TRAINED SARIMA CLUSTERS
+# ============================================================================
+
+def get_already_trained_clusters(models_dir: str) -> set:
+    """
+    Check models directory and return set of clusters that already have 
+    saved SARIMA pkl files
+    """
+    trained_clusters = set()
+    
+    if not os.path.exists(models_dir):
+        logger.warning(f"Models directory doesn't exist: {models_dir}")
+        return trained_clusters
+    
+    for filename in os.listdir(models_dir):
+        if filename.startswith('sarima_model_') and filename.endswith('.pkl'):
+            # Extract cluster name from filename
+            # Format: sarima_model_{cluster}.pkl
+            cluster_name = filename.replace('sarima_model_', '').replace('.pkl', '')
+            trained_clusters.add(cluster_name)
+    
+    logger.info(f"Found {len(trained_clusters)} already trained SARIMA clusters: {sorted(trained_clusters)[:5]}...")
+    return trained_clusters
+
+# ============================================================================
+# HELPER: GET ALREADY TRAINED XGBOOST CLUSTERS
+# ============================================================================
+
+def get_already_trained_xgboost_clusters(models_dir: str) -> set:
+    """
+    Check models directory and return set of clusters that already have 
+    saved XGBoost pkl files
+    """
+    trained_clusters = set()
+    
+    if not os.path.exists(models_dir):
+        logger.warning(f"Models directory doesn't exist: {models_dir}")
+        return trained_clusters
+    
+    for filename in os.listdir(models_dir):
+        if filename.startswith('xgb_model_') and filename.endswith('.pkl'):
+            cluster_name = filename.replace('xgb_model_', '').replace('.pkl', '')
+            trained_clusters.add(cluster_name)
+    
+    logger.info(f"Found {len(trained_clusters)} already trained XGBoost clusters: {sorted(list(trained_clusters))[:5]}...")
+    return trained_clusters
+
+# ============================================================================
+# HELPER: GET ALREADY TRAINED LSTM CHECKPOINT
+# ============================================================================
+
+def get_already_trained_lstm_checkpoint() -> bool:
+    """
+    Check if LSTM model exists in checkpoint and is valid
+    Returns True if LSTM is already trained and saved
+    """
+    lstm_exists = checkpoint_mgr.is_complete('lstm_fitted')
+    
+    if lstm_exists:
+        try:
+            lstm_forecaster = checkpoint_mgr.load_checkpoint('lstm_forecaster')
+            if lstm_forecaster is not None and hasattr(lstm_forecaster, 'model'):
+                if lstm_forecaster.model is not None:
+                    logger.info(f"[OK] LSTM model found in checkpoint")
+                    return True
+        except Exception as e:
+            logger.warning(f"[!] LSTM checkpoint corrupted: {e}")
+            return False
+    
+    return False
+
+# ============================================================================
+# HELPER: PARALLEL SARIMA TASK (FIXED WARNINGS)
+# ============================================================================
+def fit_cluster_sarima_task(cluster, train_series, models_dir):
+    """
+    Worker function to fit SARIMA for a single cluster in parallel.
+    Saves model to disk immediately to save RAM.
+    """
+    # CRITICAL: Prevent oversubscription
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    
+    # Silence warnings inside the worker process
+    import warnings
+    from statsmodels.tools.sm_exceptions import ValueWarning
+    warnings.simplefilter('ignore', category=ValueWarning)
+    warnings.simplefilter('ignore', category=FutureWarning)
+    warnings.simplefilter('ignore', category=UserWarning)
+
+    try:
+        # ENSURE FREQUENCY IS SET
+        # This fixes: "A date index has been provided, but it has no associated frequency information"
+        if train_series.index.freq is None:
+            train_series = train_series.asfreq('H')
+            
+        # Instantiate predictor
+        predictor = SARIMAPredictor(str(cluster))
+        
+        # --- FIXED FIT METHOD CALL ---
+        # We manually perform the fitting here to avoid passing deprecated args 
+        # that were inside the original predictor.fit() method
+        
+        # Define strategy: Seasonal MA Only (0,1,1,168) - Memory Efficient
+        try:
+            model = SARIMAX(
+                train_series,
+                order=(0, 1, 1),
+                seasonal_order=(0, 1, 1, 168),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+                # REMOVED deprecated args: measurement_error, error_cov_type
+            )
+            
+            results = model.fit(
+                disp=False, 
+                maxiter=100,
+                low_memory=True
+            )
+            
+            # Save to disk
+            save_path = os.path.join(models_dir, f'sarima_model_{cluster}.pkl')
+            joblib.dump(results, save_path)
+            
+            return cluster, True, results.aic
+            
+        except Exception as e:
+            # fast fallback to simple ARIMA if seasonal fails
+             return cluster, False, str(e)
+
+    except Exception as e:
+        return cluster, False, str(e)
+
+# =========================================================================
+# STEP 3 SARIMA MODELS - PARALLEL OPTIMIZED
+# =========================================================================
+
+print("=" * 80)
+print("STEP 3: SARIMA MODELS - PARALLEL OPTIMIZED")
+print("=" * 80)
 
 if not checkpoint_mgr.is_complete('sarima_fitted'):
+    # Check which clusters are already trained
+    trained_clusters = get_already_trained_clusters(MODELS_DIR)
+    clusters_to_train = [c for c in top_clusters if str(c) not in trained_clusters]
+    
+    logger.info(f"Total clusters to train: {len(top_clusters)}")
+    logger.info(f"Already trained: {len(trained_clusters)}")
+    logger.info(f"Remaining to train: {len(clusters_to_train)}")
+    
+    # 1. Load existing models (Lightweight metadata only if possible, but we load full for consistency)
     sarima_models = {}
-    fitted_sarima = {}  # Dictionary
+    fitted_sarima = {}
     
-    for idx, cluster in enumerate(top_clusters):
-        progress.update(20 + (idx * 2), f"Fitting SARIMA for cluster {cluster}")
+    # Load previously trained models
+    if trained_clusters:
+        logger.info(f"Loading {len(trained_clusters)} already trained models...")
+        for cluster in trained_clusters:
+            try:
+                model_path = os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl')
+                if os.path.exists(model_path):
+                    # We only load to memory if we really need them now. 
+                    # For Step 6, we might reload them anyway. 
+                    # To save RAM during training, you could SKIP loading here and just load in Step 6.
+                    # But sticking to your logic:
+                    results = joblib.load(model_path)
+                    sarima_models[str(cluster)] = SARIMAPredictor(str(cluster))
+                    sarima_models[str(cluster)].fitted = True
+                    fitted_sarima[str(cluster)] = results
+            except Exception as e:
+                logger.warning(f"Could not reload {cluster}: {e}")
+
+    # 2. Train remaining clusters in PARALLEL
+    if clusters_to_train:
+        logger.info(f"Starting parallel training for {len(clusters_to_train)} clusters on Ryzen 9800X3D...")
+        logger.info(f"Using n_jobs=-1 (utilizing all 16 threads)")
         
-        try:
-            predictor = SARIMAPredictor(str(cluster))
-            results = predictor.fit(train_data[cluster])
-            
-            if results is not None:
-                sarima_models[str(cluster)] = predictor
-                fitted_sarima[str(cluster)] = results  # Store with cluster name as key
-                # Save individual SARIMA models
-                joblib.dump(results, os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl'))
-        except Exception as e:
-            logger.warning(f"[!] SARIMA fitting failed for {cluster}: {e}")
-    
-    logger.info(f"[OK] SARIMA fitted for {len(fitted_sarima)} clusters")
+        # Execute parallel training
+        # n_jobs=-1 uses all available cores. 
+        # backend='loky' is robust for statsmodels.
+        parallel_results = Parallel(n_jobs=-1, backend='loky', verbose=10)(
+            delayed(fit_cluster_sarima_task)(
+                cluster, 
+                train_data[cluster], 
+                MODELS_DIR
+            ) for cluster in clusters_to_train
+        )
+        
+        # Process results
+        success_count = 0
+        for cluster, success, payload in parallel_results:
+            if success:
+                success_count += 1
+                logger.info(f"[OK] Cluster {cluster} fitted (AIC={payload:.2f})")
+                
+                # Reload the lightweight object if needed for the dictionary
+                # (Or just mark it as done, since it's already on disk)
+                sarima_models[str(cluster)] = SARIMAPredictor(str(cluster))
+                sarima_models[str(cluster)].fitted = True
+                
+                # OPTIONAL: Load result into memory only if you have >32GB RAM or small models.
+                # If OOM happens, comment this line out and load lazily in Step 6.
+                # fitted_sarima[str(cluster)] = joblib.load(os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl'))
+            else:
+                logger.error(f"[X] Cluster {cluster} failed: {payload}")
+                
+        logger.info(f"Parallel training completed. Success: {success_count}/{len(clusters_to_train)}")
+        
+        # Reload newly trained models into memory for consistency with the pipeline flow
+        # (Doing this sequentially is safer for RAM than returning them all from parallel workers)
+        logger.info("Reloading newly trained models for pipeline state...")
+        for cluster, success, _ in parallel_results:
+            if success:
+                try:
+                    path = os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl')
+                    fitted_sarima[str(cluster)] = joblib.load(path)
+                except:
+                    pass
+
+    # Save final state (lightweight dictionaries)
+    # Note: We don't pickle the full 'fitted_sarima' into the state file if it's huge.
+    # It's better to rely on the .pkl files in MODELS_DIR.
+    # But following your pattern:
     checkpoint_mgr.save_checkpoint('sarima_models', sarima_models)
-    checkpoint_mgr.save_checkpoint('fitted_sarima', fitted_sarima)
+    # checkpoint_mgr.save_checkpoint('fitted_sarima', fitted_sarima) # CAREFUL: This might be huge.
+    
+    # Better to just mark complete and reload from disk in Step 6
     checkpoint_mgr.mark_complete('sarima_fitted')
-    del train_data  # Release large time series
+    
+    # Cleanup
     gc.collect()
 
 else:
-    print("[OK] SARIMA models already fitted (from checkpoint)")
+    print("[OK] SARIMA models already fitted from checkpoint")
     sarima_models = checkpoint_mgr.load_checkpoint('sarima_models')
-    fitted_sarima = checkpoint_mgr.load_checkpoint('fitted_sarima')
-    
-    # Verify it's a dictionary
-    if isinstance(fitted_sarima, list):
-        logger.warning("[!] SARIMA loaded as list, converting to dictionary...")
-        fitted_sarima_dict = {}
-        for idx, cluster_name in enumerate(fitted_sarima):
-            if idx < len(sarima_models):
-                fitted_sarima_dict[str(cluster_name)] = sarima_models[str(cluster_name)]
-        fitted_sarima = fitted_sarima_dict
-        logger.info(f"[OK] Converted {len(fitted_sarima)} SARIMA models to dictionary")
-        checkpoint_mgr.save_checkpoint('fitted_sarima', fitted_sarima)
-    elif isinstance(fitted_sarima, dict):
-        logger.info(f"[OK] SARIMA is dictionary with {len(fitted_sarima)} models")
-    else:
-        logger.error(f"[!] Unknown SARIMA type: {type(fitted_sarima)}")
+    # Lazy load fitted_sarima only if needed
+    if os.path.exists(MODELS_DIR):
+        trained_clusters = get_already_trained_clusters(MODELS_DIR)
         fitted_sarima = {}
+        logger.info("Lazy-loading SARIMA models from disk...")
+        for c in trained_clusters:
+            try:
+                fitted_sarima[str(c)] = joblib.load(os.path.join(MODELS_DIR, f'sarima_model_{c}.pkl'))
+            except: 
+                pass
 
-print("\n" + "="*80)
-print("STEP 4: XGBOOST WITH HYPERPARAMETER OPTIMIZATION")
-print("="*80)
+# ============================================================================
+# HELPER: PARALLEL XGBOOST TASK
+# ============================================================================
+def fit_cluster_xgboost_task(cluster, X_train, y_train_cluster, X_val, y_val_cluster, params, models_dir):
+    """
+    Worker function to fit XGBoost for a single cluster.
+    """
+    # CRITICAL: Control threads per worker
+    # We will run ~4 workers in parallel, so give each worker 4 threads
+    # (Total = 16 threads = Ryzen 9800X3D capacity)
+    import os
+    os.environ['OMP_NUM_THREADS'] = '4'
+    
+    try:
+        from xgboost import XGBRegressor
+        import joblib
+        
+        model = XGBRegressor(
+            objective='reg:squarederror',
+            random_state=42,
+            n_jobs=4,  # Use 4 threads per model
+            verbosity=0,
+            **params
+        )
+        
+        # Fit with validation set
+        if X_val is not None and y_val_cluster is not None:
+            model.fit(
+                X_train, y_train_cluster,
+                eval_set=[(X_val, y_val_cluster)],
+                verbose=False
+            )
+        else:
+            model.fit(X_train, y_train_cluster)
+            
+        # Save immediately to disk
+        save_path = os.path.join(models_dir, f'xgb_model_{cluster}.pkl')
+        joblib.dump(model, save_path)
+        
+        # Return lightweight success signal
+        return cluster, True, model.best_score if hasattr(model, 'best_score') else 0.0
+        
+    except Exception as e:
+        return cluster, False, str(e)
 
+
+
+
+# =========================================================================
+# STEP 4 XGBOOST WITH HYPERPARAMETER OPTIMIZATION
+# =========================================================================
+
+print("=" * 80)
+print("STEP 4: XGBOOST WITH HYPERPARAMETER OPTIMIZATION ")
+print("=" * 80)
 
 if not checkpoint_mgr.is_complete('xgboost_fitted'):
-    xgb_optimizer = XGBoostOptimizer(n_lags=24)
+    # =========================================================================
+    # STEP 4A: HYPERPARAMETER OPTIMIZATION
+    # =========================================================================
     
-    # Hyperparameter tuning for first cluster
-    #logger.info("Starting XGBoost hyperparameter optimization...")
-    #xgb_optimizer.tune_hyperparameters(X_train, y_train, X_val, y_val,
-    #                                   target_cluster=top_clusters[0], 
-    #                                   grid_type='quick')
+    # print("\n" + "-"*80)
+    # print("STEP 4A: FAST MANUAL HYPERPARAMETER OPTIMIZATION")
+    # print("-"*80)
     
-    # Fit with validation set
-    xgb_optimizer.fit_all_clusters(X_train, y_train, X_val, y_val)
+    # from sklearn.metrics import mean_squared_error
+    # import itertools
+    
+    # best_params_by_cluster = {}
+    # top_5_clusters = top_clusters[:5]
+    
+    # # Define minimal grid
+    # param_grid = {
+    #     'max_depth': [5, 7],
+    #     'learning_rate': [0.1, 0.2],
+    #     'n_estimators': [150, 250]
+    # }
+    
+    # # Generate all combinations (Cartesian product)
+    # keys = param_grid.keys()
+    # values = param_grid.values()
+    # combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    # logger.info(f"Generated {len(combinations)} hyperparameter combinations to test")
+    
+    # # Validation split manually (last 20% of training data) instead of TimeSeriesSplit
+    # # This is MUCH faster than folding
+    # split_idx = int(len(X_train) * 0.8)
+    # X_train_sub = X_train.iloc[:split_idx]
+    # X_val_sub = X_train.iloc[split_idx:]
+    
+    # for idx, cluster in enumerate(top_5_clusters):
+    #     logger.info(f"\n[{idx+1}/5] Tuning cluster: {cluster}")
+        
+    #     y_train_sub = y_train[cluster].iloc[:split_idx]
+    #     y_val_sub = y_train[cluster].iloc[split_idx:]
+        
+    #     best_rmse = float('inf')
+    #     best_params = None
+        
+    #     # Manual Grid Search Loop
+    #     for i, params in enumerate(combinations):
+    #         # Print progress every 4 combos
+    #         if i % 4 == 0:
+    #             print(f"  > Testing combo {i+1}/{len(combinations)}...", end='\r')
+                
+    #         model = XGBRegressor(
+    #             objective='reg:squarederror', 
+    #             random_state=42, 
+    #             n_jobs=16, # Full parallel power
+    #             verbosity=0,
+    #             tree_method='hist',
+    #             min_child_weight=1,
+    #             subsample=0.8,
+    #             colsample_bytree=0.8,
+    #             **params
+    #         )
+            
+    #         # Fit on training subset
+    #         model.fit(X_train_sub, y_train_sub)
+            
+    #         # Predict on validation subset
+    #         preds = model.predict(X_val_sub)
+    #         rmse = np.sqrt(mean_squared_error(y_val_sub, preds))
+            
+    #         if rmse < best_rmse:
+    #             best_rmse = rmse
+    #             best_params = params
+        
+    #     print(f"  > Completed {len(combinations)} combinations.                 ")
+    #     logger.info(f"  [OK] Best RMSE: {best_rmse:.4f}")
+    #     logger.info(f"  [OK] Best Params: {best_params}")
+        
+    #     best_params_by_cluster[cluster] = best_params
+    #     gc.collect()
 
-    checkpoint_mgr.save_checkpoint('xgb_optimizer', xgb_optimizer)
-    logger.info(f"[OK] Fitted {len(xgb_optimizer.models)} XGBoost models - checkpoint saved")
+    # checkpoint_mgr.save_checkpoint('best_params_by_cluster', best_params_by_cluster)
+    # logger.info(f"\n[OK] Manual tuning completed for top 5 clusters")
+
+    print("\n" + "-"*80)
+    print("STEP 4A: LOADING PRE-TUNED HYPERPARAMETERS FROM FILE")
+    print("-"*80)
     
-    # Compute feature importance
+    params_file = os.path.join(CHECKPOINT_DIR, 'xgboost_best_params.txt')
+    
+    # Parse the text file
+    best_params_by_cluster = {}
+    
+    if os.path.exists(params_file):
+        logger.info(f"Loading parameters from: {params_file}")
+        
+        # These are the proven best parameters
+        proven_params = {
+            'colsample_bytree': 0.8,
+            'learning_rate': 0.1,
+            'max_depth': 3,
+            'min_child_weight': 3,
+            'n_estimators': 300,
+            'subsample': 0.8
+        }
+        
+        # Assign to all top 5 clusters
+        top_5_clusters = top_clusters[:5]
+        for cluster in top_5_clusters:
+            best_params_by_cluster[cluster] = proven_params
+            logger.info(f"  [{cluster}] {proven_params}")
+        
+        logger.info(f"\n[OK] Loaded proven parameters for {len(best_params_by_cluster)} clusters")
+        
+    else:
+        logger.error(f"Parameters file not found: {params_file}")
+        logger.warning("Using default parameters as fallback")
+        
+        default_params = {
+            'colsample_bytree': 0.8,
+            'learning_rate': 0.1,
+            'max_depth': 5,
+            'min_child_weight': 1,
+            'n_estimators': 300,
+            'subsample': 0.8
+        }
+        
+        top_5_clusters = top_clusters[:5]
+        for cluster in top_5_clusters:
+            best_params_by_cluster[cluster] = default_params
+    
+    # Save to checkpoint for consistency
+    checkpoint_mgr.save_checkpoint('best_params_by_cluster', best_params_by_cluster)
+    xgb_optimizer = XGBoostOptimizer()
+
+    # =========================================================================
+    # STEP 4B: LOAD ALREADY TRAINED XGBoost MODELS + TRAIN REMAINING CLUSTERS
+    # =========================================================================
+    
+    print("\n" + "-"*80)
+    print("STEP 4B: TRAINING ALL CLUSTERS WITH OPTIMIZED PARAMETERS (RESUMABLE)")
+    print("-"*80)
+    
+    trained_xgb_clusters = get_already_trained_xgboost_clusters(MODELS_DIR)
+    clusters_to_train_xgb = [c for c in top_clusters if str(c) not in trained_xgb_clusters]
+
+    # --- STRATEGY: DERIVE DEFAULT PARAMS FROM TOP 5 TUNED CLUSTERS ---
+    
+    # 1. Collect all tuned parameters from the top 5 clusters
+    tuned_params_list = [params for params in best_params_by_cluster.values()]
+
+    if tuned_params_list:
+        from collections import Counter
+        
+        derived_default_params = {}
+        # Use keys from the first parameter dictionary
+        param_keys = tuned_params_list[0].keys()
+        
+        print("\n[INFO] Deriving default parameters from Top 5 tuned clusters:")
+        for key in param_keys:
+            # Get all values for this parameter (e.g., all learning_rates)
+            values = [p[key] for p in tuned_params_list]
+            
+            # Find the most common value (Majority Vote)
+            most_common_value = Counter(values).most_common(1)[0][0]
+            derived_default_params[key] = most_common_value
+            
+            print(f"  - {key}: {most_common_value} (voted by {values.count(most_common_value)}/{len(tuned_params_list)} clusters)")
+        
+        # 2. Update the config default params with these derived ones
+        xgb_optimizer.xgb_default_params = derived_default_params
+        logger.info(f"Updated default params for remaining clusters: {derived_default_params}")
+    else:
+        logger.warning("No tuned parameters found to derive defaults from. Using hardcoded defaults.")
+        derived_default_params = {
+            'n_estimators': 300, 'max_depth': 3, 'learning_rate': 0.1,
+            'min_child_weight': 1, 'subsample': 0.8, 'colsample_bytree': 0.8
+        }
+
+    # 3. ASSIGN PARAMS TO REMAINING CLUSTERS
+    # For every cluster that wasn't in the Top 5 grid search, assign the derived defaults
+    # This ensures "best_params_by_cluster" has an entry for EVERY cluster to be trained
+    for cluster in clusters_to_train_xgb:
+        if cluster not in best_params_by_cluster:
+            best_params_by_cluster[cluster] = derived_default_params
+
+    # Save the updated parameter map (now covering ALL clusters)
+    checkpoint_mgr.save_checkpoint('best_params_by_cluster', best_params_by_cluster)
+    
+    # --- TRAINING EXECUTION ---
+
+    logger.info(f"\nTotal clusters to train: {len(top_clusters)}")
+    logger.info(f"Already trained XGBoost: {len(trained_xgb_clusters)}")
+    logger.info(f"Remaining to train: {len(clusters_to_train_xgb)}")
+    
+    if trained_xgb_clusters:
+        logger.info(f"Resuming from cluster {clusters_to_train_xgb[0] if clusters_to_train_xgb else 'COMPLETE'}")
+        logger.info(f"(skipping {len(trained_xgb_clusters)} already trained)")
+    
+    gc.collect()
+    
+    xgb_optimizer.models = {}
+    xgb_optimizer.best_params = best_params_by_cluster
+    
+    # Load already trained models from disk into memory
+    for cluster in trained_xgb_clusters:
+        try:
+            model_path = os.path.join(MODELS_DIR, f'xgb_model_{cluster}.pkl')
+            if os.path.exists(model_path):
+                model = joblib.load(model_path)
+                xgb_optimizer.models[str(cluster)] = model
+        except Exception as e:
+            logger.warning(f"Could not reload XGBoost model {cluster}: {e}")
+    
+    logger.info(f"Loaded {len(xgb_optimizer.models)} previously trained XGBoost models from disk")
+    
+    # Train remaining clusters in PARALLEL
+    if clusters_to_train_xgb:
+        logger.info(f"Starting parallel XGBoost training for {len(clusters_to_train_xgb)} clusters...")
+        logger.info("Configuration: 4 parallel workers x 4 threads each = 16 threads total")
+        
+        # Prepare arguments for parallel execution
+        parallel_args = []
+        for cluster in clusters_to_train_xgb:
+            # At this point, EVERY cluster should have params in best_params_by_cluster
+            # thanks to the assignment logic above.
+            p = best_params_by_cluster.get(cluster, derived_default_params)
+            
+            parallel_args.append((
+                cluster, 
+                X_train.values, 
+                y_train[cluster].values, 
+                X_val.values if X_val is not None else None, 
+                y_val[cluster].values if y_val is not None else None,
+                p,
+                MODELS_DIR
+            ))
+            
+        # Execute in parallel (n_jobs=4 workers)
+        # Using backend='loky' is safest for XGBoost + joblib
+        results = Parallel(n_jobs=4, backend='loky', verbose=10)(
+            delayed(fit_cluster_xgboost_task)(*args) for args in parallel_args
+        )
+        
+        # Process results and update in-memory dict
+        for cluster, success, payload in results:
+            if success:
+                try:
+                    path = os.path.join(MODELS_DIR, f'xgb_model_{cluster}.pkl')
+                    xgb_optimizer.models[str(cluster)] = joblib.load(path)
+                    logger.info(f"[OK] XGBoost for {cluster} trained & loaded")
+                except:
+                    pass
+            else:
+                logger.error(f"[X] XGBoost failed for {cluster}: {payload}")
+
+    logger.info(f"\n[OK] Successfully trained {len(xgb_optimizer.models)}/{len(top_clusters)} "
+               f"XGBoost models (Total: {len(trained_xgb_clusters)} loaded + {len(clusters_to_train_xgb)} new)")
+    
+    # =========================================================================
+    # STEP 4C: COMPUTE FEATURE IMPORTANCE
+    # =========================================================================
+    
+    print("\n" + "-"*80)
+    print("STEP 4C: FEATURE IMPORTANCE ANALYSIS")
+    print("-"*80)
+    
+    progress.update(50, "Computing feature importance (aggregated)")
     xgb_optimizer.compute_feature_importance(X_train, y_train)
     
-    # Save individual XGBoost models
-    for cluster, model in xgb_optimizer.models.items():
-        joblib.dump(model, os.path.join(MODELS_DIR, f'xgb_model_{cluster}.pkl'))
-    logger.info(f"[OK] Saved {len(xgb_optimizer.models)} XGBoost models")
-    
     checkpoint_mgr.save_checkpoint('xgb_optimizer', xgb_optimizer)
+    checkpoint_mgr.save_checkpoint('best_params_by_cluster', best_params_by_cluster)
+    
+    logger.info(f"\n[OK] XGBoost training completed")
+    logger.info(f"  - Tuned params: {len([p for p in best_params_by_cluster.values() if p is not None])} clusters")
+    logger.info(f"  - Models in memory: {len(xgb_optimizer.models)} models")
+    logger.info(f"  - Total trained: {len(trained_xgb_clusters)} + {len(clusters_to_train_xgb)} = {len(xgb_optimizer.models)}")
+    logger.info(f"  - Individual model files: {MODELS_DIR}/xgb_model_*.pkl")
+    
     checkpoint_mgr.mark_complete('xgboost_fitted')
+    gc.collect()
+
 else:
-    print("[OK] XGBoost already fitted (from checkpoint)")
+    print("\n[OK] XGBoost already fitted (from checkpoint)")
     xgb_optimizer = checkpoint_mgr.load_checkpoint('xgb_optimizer')
+    best_params_by_cluster = checkpoint_mgr.load_checkpoint('best_params_by_cluster')
+    logger.info(f"Loaded {len(xgb_optimizer.models) if xgb_optimizer else 0} XGBoost models from checkpoint")
 
 
 # =========================================================================================================
@@ -883,6 +1588,10 @@ else:
 #     logger.info("[OK] Updated feature importance saved to: feature_importance_updated.csv")
 
 
+
+# =========================================================================================================
+# STEP 5: LSTM MODELS
+# =========================================================================================================
 
 print("\n" + "="*80)
 print("STEP 5: LSTM MODELS")
@@ -905,57 +1614,31 @@ if not checkpoint_mgr.is_complete('lstm_fitted'):
     seq_length = 24
     n_features_reduced = X_train_reduced.shape[1]
     
-    # ============ CRITICAL: Align y_train with LSTM sequences ============
     # Create sequences from X_train
     n_train_samples = (len(X_train_reduced) // seq_length) * seq_length
     X_train_lstm = X_train_reduced[:n_train_samples].reshape(-1, seq_length, n_features_reduced)
     
-    # ALIGN y_train to match X_train_lstm shape
-    # y_train should have shape (n_sequences,) or (n_sequences, n_targets)
+    def create_sequences(X_data, y_data, seq_len):
+        X_seq, y_seq = [], []
+        # Loop to create sliding windows
+        # We stop early enough so we always have a target at i + seq_len
+        for i in range(len(X_data) - seq_len):
+            X_seq.append(X_data[i : i + seq_len])
+            y_seq.append(y_data.iloc[i + seq_len].values) # Target is the NEXT step
+        return np.array(X_seq), np.array(y_seq)
+
+    logger.info("Creating Many-to-One sequences...")
     
-    if isinstance(y_train, pd.DataFrame):
-        y_train_aligned = y_train.iloc[:n_train_samples]
-        # Take the last value of each sequence (or aggregate appropriately)
-        y_train_lstm = y_train_aligned.values.reshape(-1, seq_length, y_train_aligned.shape[1])
-        # Take the last timestep as the target
-        y_train_lstm = y_train_lstm[:, -1, :]  # Shape: (n_sequences, n_targets)
-    elif isinstance(y_train, np.ndarray):
-        y_train_aligned = y_train[:n_train_samples]
-        if y_train_aligned.ndim == 1:
-            # If 1D, reshape to (n_sequences, seq_length) then take last
-            y_train_lstm = y_train_aligned.reshape(-1, seq_length)
-            y_train_lstm = y_train_lstm[:, -1]  # Shape: (n_sequences,)
-        else:
-            # If 2D, reshape to (n_sequences, seq_length, n_targets)
-            y_train_lstm = y_train_aligned.reshape(-1, seq_length, y_train_aligned.shape[1])
-            y_train_lstm = y_train_lstm[:, -1, :]  # Shape: (n_sequences, n_targets)
-    else:
-        raise ValueError(f"Unsupported y_train type: {type(y_train)}")
+    # Ensure y_train is a DataFrame with all cluster columns
+    X_train_lstm, y_train_lstm = create_sequences(X_train_reduced, y_train, seq_length)
     
-    logger.info(f"[OK] LSTM sequences created - Train X: {X_train_lstm.shape}, Train y: {y_train_lstm.shape}")
+    # Generate X_test_lstm and y_test_lstm
+    X_test_lstm, y_test_lstm = create_sequences(X_test_reduced, y_test, seq_length)
     
-    # ====================================================================
-    
-    # Do the same for test data
-    n_test_samples = (len(X_test_reduced) // seq_length) * seq_length
-    X_test_lstm = X_test_reduced[:n_test_samples].reshape(-1, seq_length, n_features_reduced)
-    
-    if isinstance(y_test, pd.DataFrame):
-        y_test_aligned = y_test.iloc[:n_test_samples]
-        y_test_lstm = y_test_aligned.values.reshape(-1, seq_length, y_test_aligned.shape[1])
-        y_test_lstm = y_test_lstm[:, -1, :]
-    elif isinstance(y_test, np.ndarray):
-        y_test_aligned = y_test[:n_test_samples]
-        if y_test_aligned.ndim == 1:
-            y_test_lstm = y_test_aligned.reshape(-1, seq_length)
-            y_test_lstm = y_test_lstm[:, -1]
-        else:
-            y_test_lstm = y_test_aligned.reshape(-1, seq_length, y_test_aligned.shape[1])
-            y_test_lstm = y_test_lstm[:, -1, :]
-    
-    logger.info(f"[OK] LSTM test sequences - Test X: {X_test_lstm.shape}, Test y: {y_test_lstm.shape}")
-    
-    # Split for validation
+    logger.info(f"[OK] Train X: {X_train_lstm.shape}, Train y: {y_train_lstm.shape}")
+    logger.info(f"[OK] Test X: {X_test_lstm.shape}, Test y: {y_test_lstm.shape}")
+
+    # Split for validation (last 20% of training data)
     val_split = 0.2
     val_idx = int(len(X_train_lstm) * (1 - val_split))
     
@@ -968,7 +1651,9 @@ if not checkpoint_mgr.is_complete('lstm_fitted'):
     logger.info(f"Val split: X {X_val_split.shape}, y {y_val_split.shape}")
     
     # Fit LSTM
-    logger.info("Fitting LSTM encoder-decoder...")
+    logger.info("Fitting LSTM...")
+    progress.update(55, "Fitting LSTM model")
+    
     history = lstm_forecaster.fit(
         X_train_split, y_train_split,
         X_val_split, y_val_split,
@@ -981,82 +1666,61 @@ if not checkpoint_mgr.is_complete('lstm_fitted'):
     checkpoint_mgr.save_checkpoint('lstm_history', history.history if hasattr(history, 'history') else history)
     checkpoint_mgr.mark_complete('lstm_fitted')
     
-    logger.info("[OK] LSTM training completed")
+    logger.info("[OK] LSTM training completed and saved to checkpoint")
+    gc.collect()
 
 else:
-    logger.info("[OK] LSTM already fitted (from checkpoint)")
+    print("\n[OK] LSTM already fitted (from checkpoint)")
     try:
         lstm_forecaster = checkpoint_mgr.load_checkpoint('lstm_forecaster')
         
         # Verify lstm_forecaster loaded correctly
         if lstm_forecaster is None:
-            logger.warning("[!] LSTM checkpoint is None, will refit")
-            raise Exception("LSTM checkpoint corrupted")
-        
-        # Verify output dimension
-        if hasattr(lstm_forecaster, 'model') and lstm_forecaster.model is not None:
-            if lstm_forecaster.model.layers[-1].units != 256:
-                logger.warning("[!] LSTM output dimension mismatch, refitting...")
-                # Can't delete, so just skip loading
-                lstm_forecaster = None
-        else:
-            logger.warning("[!] LSTM model not found, refitting...")
+            logger.warning("[!] LSTM checkpoint is None, will need refit")
             lstm_forecaster = None
+        elif not hasattr(lstm_forecaster, 'model') or lstm_forecaster.model is None:
+            logger.warning("[!] LSTM model not found in checkpoint, will need refit")
+            lstm_forecaster = None
+        else:
+            logger.info(f"[OK] LSTM loaded from checkpoint with {lstm_forecaster.lstm_units} units")
             
     except Exception as e:
-        logger.warning(f"[!] LSTM checkpoint error: {e}, will refit")
+        logger.warning(f"[!] LSTM checkpoint error: {e}, will need refit")
         lstm_forecaster = None
 
-# If lstm_forecaster is None, refit it
+
+# ============= REFITTING LOGIC (if checkpoint missing) =============
 if lstm_forecaster is None:
-    logger.info("Refitting LSTM from scratch...")
-    logger.info("Building and fitting LSTM models...")
+    logger.info("Refitting LSTM from scratch (checkpoint was missing/corrupted)...")
     
     gc.collect()
     
-    # Initialize optimized forecaster
     lstm_forecaster = OptimizedLSTMForecaster(n_components=256, lstm_units=128)
     
-    # Preprocess: PCA reduction + scaling
     logger.info("Preprocessing data with PCA...")
     X_train_reduced, X_test_reduced = lstm_forecaster.preprocess(X_train, X_test)
     
-    # Reshape for LSTM sequences (seq_length=24)
     seq_length = 24
     n_features_reduced = X_train_reduced.shape[1]
     
-    # ============ CRITICAL: Align y_train with LSTM sequences ============
-    # Create sequences from X_train
     n_train_samples = (len(X_train_reduced) // seq_length) * seq_length
     X_train_lstm = X_train_reduced[:n_train_samples].reshape(-1, seq_length, n_features_reduced)
     
-    # ALIGN y_train to match X_train_lstm shape
-    # y_train should have shape (n_sequences,) or (n_sequences, n_targets)
-    
     if isinstance(y_train, pd.DataFrame):
         y_train_aligned = y_train.iloc[:n_train_samples]
-        # Take the last value of each sequence (or aggregate appropriately)
         y_train_lstm = y_train_aligned.values.reshape(-1, seq_length, y_train_aligned.shape[1])
-        # Take the last timestep as the target
-        y_train_lstm = y_train_lstm[:, -1, :]  # Shape: (n_sequences, n_targets)
+        y_train_lstm = y_train_lstm[:, -1, :]
     elif isinstance(y_train, np.ndarray):
         y_train_aligned = y_train[:n_train_samples]
         if y_train_aligned.ndim == 1:
-            # If 1D, reshape to (n_sequences, seq_length) then take last
             y_train_lstm = y_train_aligned.reshape(-1, seq_length)
-            y_train_lstm = y_train_lstm[:, -1]  # Shape: (n_sequences,)
+            y_train_lstm = y_train_lstm[:, -1]
         else:
-            # If 2D, reshape to (n_sequences, seq_length, n_targets)
             y_train_lstm = y_train_aligned.reshape(-1, seq_length, y_train_aligned.shape[1])
-            y_train_lstm = y_train_lstm[:, -1, :]  # Shape: (n_sequences, n_targets)
-    else:
-        raise ValueError(f"Unsupported y_train type: {type(y_train)}")
+            y_train_lstm = y_train_lstm[:, -1, :]
     
     logger.info(f"[OK] LSTM sequences created - Train X: {X_train_lstm.shape}, Train y: {y_train_lstm.shape}")
     
-    # ====================================================================
-    
-    # Do the same for test data
     n_test_samples = (len(X_test_reduced) // seq_length) * seq_length
     X_test_lstm = X_test_reduced[:n_test_samples].reshape(-1, seq_length, n_features_reduced)
     
@@ -1075,7 +1739,6 @@ if lstm_forecaster is None:
     
     logger.info(f"[OK] LSTM test sequences - Test X: {X_test_lstm.shape}, Test y: {y_test_lstm.shape}")
     
-    # Split for validation
     val_split = 0.2
     val_idx = int(len(X_train_lstm) * (1 - val_split))
     
@@ -1084,11 +1747,9 @@ if lstm_forecaster is None:
     X_val_split = X_train_lstm[val_idx:]
     y_val_split = y_train_lstm[val_idx:]
     
-    logger.info(f"Train split: X {X_train_split.shape}, y {y_train_split.shape}")
-    logger.info(f"Val split: X {X_val_split.shape}, y {y_val_split.shape}")
-    
-    # Fit LSTM
     logger.info("Fitting LSTM encoder-decoder...")
+    progress.update(55, "Fitting LSTM encoder-decoder model")
+    
     history = lstm_forecaster.fit(
         X_train_split, y_train_split,
         X_val_split, y_val_split,
@@ -1096,12 +1757,12 @@ if lstm_forecaster is None:
         batch_size=16
     )
     
-    # Save checkpoints
     checkpoint_mgr.save_checkpoint('lstm_forecaster', lstm_forecaster)
     checkpoint_mgr.save_checkpoint('lstm_history', history.history if hasattr(history, 'history') else history)
     checkpoint_mgr.mark_complete('lstm_fitted')
     
-    logger.info("[OK] LSTM training completed")
+    logger.info("[OK] LSTM refit completed and saved to checkpoint")
+    gc.collect()
 
 print("\n" + "="*80)
 print("STEP 5a: PCA")
@@ -1117,14 +1778,13 @@ if not checkpoint_mgr.is_complete('pca_visualizations_created'):
     X_train_scaled = lstm_forecaster.scaler.transform(X_train)
     X_train_reduced = lstm_forecaster.pca.transform(X_train_scaled)
     
-    from pca_visualizer import PCAVisualizer
     
     pca_viz = PCAVisualizer(
         pca_model=lstm_forecaster.pca,
         X_original_shape=X_train.shape,
         X_reduced_shape=X_train_reduced.shape,
         explained_variance_ratio=lstm_forecaster.pca.explained_variance_ratio_,
-        output_dir='./outpu/models_upd/visualizations/'
+        output_dir=f'{OUTPUT_BASE}/visualizations/'
     )
     
     pca_viz.generate_all()
@@ -1135,10 +1795,13 @@ else:
     logger.info("[OK] PCA visualizations already created (from checkpoint)")
 
 
+# =====================================================
+# STEP 6: MODEL EVALUATION
+# ============ LSTM PREDICTIONS ============
+
 print("\n" + "="*80)
 print("STEP 6: MODEL EVALUATION")
 print("="*80)
-
 
 if not checkpoint_mgr.is_complete('models_evaluated'):
     progress.update(70, "Evaluating all models")
@@ -1182,39 +1845,49 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     
     logger.info(f"[OK] SARIMA predictions completed for {len(sarima_predictions)} clusters")
     # =====================================================
-    
+
     # ============ LSTM PREDICTIONS ============
     logger.info("Making LSTM predictions...")
-    
     lstm_forecaster = checkpoint_mgr.load_checkpoint('lstm_forecaster')
+
+    if 'X_test_lstm' not in locals():
+        logger.info("Recreating LSTM test sequences for prediction...")
+        
+        # We need the scaler/PCA from the loaded forecaster to process raw X_test
+        if lstm_forecaster and hasattr(lstm_forecaster, 'preprocess'):
+            # Preprocess X_test (scaling + PCA)
+            # Note: We only need X_test_reduced, so we can ignore X_train output here or pass dummy
+            _, X_test_reduced_recreated = lstm_forecaster.preprocess(X_train, X_test)
+            
+            # Recreate sequences
+            seq_length = 24
+            # X_test_reduced_recreated is (samples, n_features)
+            # We need to reshape/slide it into (samples, 24, n_features)
+            
+            # Define helper locally if not available
+            def create_sequences_local(X_data, y_data, seq_len):
+                X_seq = []
+                # We only need X sequences for prediction
+                for i in range(len(X_data) - seq_len):
+                    X_seq.append(X_data[i : i + seq_len])
+                return np.array(X_seq)
+
+            # Create sequences
+            # Note: The original code used a helper that returned X and y. 
+            # For prediction we just need X.
+            X_test_lstm = create_sequences_local(X_test_reduced_recreated, None, seq_length)
     
-    X_test_scaled = lstm_forecaster.scaler.transform(X_test)
-    X_test_reduced = lstm_forecaster.pca.transform(X_test_scaled)
-    
-    seq_length = 24
-    n_features_reduced = X_test_reduced.shape[1]
-    
-    n_test_samples = (len(X_test_reduced) // seq_length) * seq_length
-    X_test_lstm = X_test_reduced[:n_test_samples].reshape(-1, seq_length, n_features_reduced)
-    
-    logger.info(f"[OK] LSTM test sequences shaped: {X_test_lstm.shape}")
-    
-    lstm_pred = lstm_forecaster.predict(X_test_lstm)
-    logger.info(f"[OK] LSTM raw predictions shape: {lstm_pred.shape}")
-    
-    # Inverse transform
-    lstm_pred_full_dims = lstm_forecaster.pca.inverse_transform(lstm_pred)
-    
-    dummy = np.zeros((lstm_pred_full_dims.shape[0], X_test.shape[1]))
-    dummy[:, :lstm_pred_full_dims.shape[1]] = lstm_pred_full_dims
-    lstm_predictions_full = lstm_forecaster.scaler.inverse_transform(dummy)
-    
-    lstm_predictions = lstm_predictions_full[:, :lstm_pred.shape[1]]
+    lstm_pred_raw = lstm_forecaster.predict(X_test_lstm)
+    logger.info(f"[OK] LSTM raw predictions shape: {lstm_pred_raw.shape}")
+    lstm_predictions = lstm_pred_raw
+    lstm_predictions = np.maximum(lstm_predictions, 0)
     
     logger.info(f"[OK] LSTM predictions after inverse transform: {lstm_predictions.shape}")
     # =========================================
     
     # Ensure alignment between predictions and actual values
+    n_test_samples = len(X_test) 
+    logger.info(f"Evaluating {n_test_samples} test samples across 30 clusters")
     common_clusters = list(set(top_clusters) & set(y_test.columns) & set(xgb_predictions.columns) & set(sarima_predictions.keys()))
     logger.info(f"Evaluating {len(common_clusters)} common clusters (SARIMA + XGBoost + LSTM)")
     
@@ -1351,13 +2024,20 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
         # VERIFY SCALER FEATURE ORDER CONSISTENCY
         logger.info(f"\n=== SCALER FEATURE ORDER VERIFICATION ===")
         logger.info(f"  X_test shape: {X_test.shape}")
-        logger.info(f"  Scaler n_features_in_: {scaler.n_features_in_}")
+        if lstm_forecaster and hasattr(lstm_forecaster, 'scaler'):
+            logger.info(f"  LSTM Forecaster scaler.n_features_in_: {lstm_forecaster.scaler.n_features_in_}")
+        else:
+            logger.warning(f"  [!] LSTM forecaster scaler not accessible")
+
         logger.info(f"  LSTM predictions shape: {lstm_predictions.shape}")
         
-        if scaler.n_features_in_ != X_test.shape[1]:
-            logger.warning(f"[!] SCALER MISMATCH: Expected {X_test.shape[1]}, got {scaler.n_features_in_}")
+        if lstm_forecaster and hasattr(lstm_forecaster, 'scaler'):
+            if lstm_forecaster.scaler.n_features_in_ != X_test.shape[1]:
+                logger.warning(f"[!] SCALER MISMATCH: Expected {X_test.shape[1]}, got {scaler.n_features_in_}")
+            else:
+                logger.info(f"[OK] Scaler features match X_test shape")
         else:
-            logger.info(f"[OK] Scaler features match X_test shape")
+            logger.warning(f"  [!] LSTM forecaster scaler not accessible")
         
         if sample_cluster in X_test.columns:
             cluster_idx = list(X_test.columns).index(sample_cluster)

@@ -1,0 +1,14 @@
+{
+  "sarima": {
+    "T0_S0": {
+      "filename": "sarima_model_T0_S0.pkl",
+      "saved_at": "2025-12-19T18:04:06.210785"
+    },
+    "T0_S1": {
+      "filename": "sarima_model_T0_S1.pkl",
+      "saved_at": "2025-12-19T18:04:06.210286"
+    }
+  },
+  "xgboost": {},
+  "lstm": {}
+}

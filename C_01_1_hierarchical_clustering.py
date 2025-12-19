@@ -370,7 +370,7 @@ def get_adaptive_hdbscan_params(coords_scaled_clean, t_id):
     """Adjust HDBSCAN params based on SPATIAL DENSITY, not just point count"""
     n_points = len(coords_scaled_clean)
     
-    # Sample for density calculation (avoid computing on millions of points)
+    # Sample for density calculation
     sample_size = min(10000, n_points)
     sample_indices = np.random.choice(n_points, sample_size, replace=False)
     coords_sample = coords_scaled_clean[sample_indices]
@@ -428,8 +428,8 @@ def spatial_clustering_within_temporal(df):
     + Much finer granularity than HDBSCAN alone
     + Better geographic coverage with small zones
     
-    PARAMETERS TUNED FOR NYC TAXI DATA:
-    - HDBSCAN min_cluster_size=400: Conservative, finds major hotspots
+    PARAMETERS TUNED:
+    - HDBSCAN min_cluster_size=400: Conservative
     - HDBSCAN min_samples: Reasonable density threshold
     - HDBSCAN cluster_selection_epsilon: Scaled coordinates unit
     - StandardScaler: Normalize coordinates to [-1, 1] range for HDBSCAN
