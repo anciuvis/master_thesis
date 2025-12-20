@@ -4,10 +4,10 @@
   "features_engineered": true,
   "sarima_fitted": true,
   "xgboost_fitted": true,
-  "lstm_fitted": true,
-  "models_evaluated": true,
+  "lstm_fitted": false,
+  "models_evaluated": false,
   "feature_importance_computed": false,
-  "visualizations_created": true,
+  "visualizations_created": false,
   "report_generated": false,
-  "pca_visualizations_created": true
+  "pca_visualizations_created": false
 }

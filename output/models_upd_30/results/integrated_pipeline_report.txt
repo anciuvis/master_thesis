@@ -2,7 +2,7 @@
 ================================================================================
 INTEGRATED FORECASTING PIPELINE - FINAL REPORT (FIXED VERSION)
 ================================================================================
-Generated: 2025-12-20 00:36:26
+Generated: 2025-12-20 18:52:08
 
 FIXES APPLIED:
 1. SHAP library import check added
@@ -19,7 +19,7 @@ FIXES APPLIED:
 MODELS EVALUATED:
 1. SARIMA (Seasonal ARIMA) - with rolling forecast
 2. XGBoost - with hyperparameter optimization & early stopping
-3. LSTM - encoder-decoder architecture
+3. LSTM
 
 FEATURE ENGINEERING:
 - Lag features: 91143 total features
