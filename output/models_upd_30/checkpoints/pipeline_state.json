@@ -2,12 +2,12 @@
   "data_loaded": true,
   "data_prepared": true,
   "features_engineered": true,
-  "sarima_fitted": true,
-  "xgboost_fitted": true,
-  "lstm_fitted": false,
+  "sarima_fitted": false,
+  "xgboost_fitted": false,
+  "lstm_fitted": true,
   "models_evaluated": false,
   "feature_importance_computed": false,
   "visualizations_created": false,
   "report_generated": false,
-  "pca_visualizations_created": false
+  "pca_visualizations_created": true
 }

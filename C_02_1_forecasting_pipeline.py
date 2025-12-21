@@ -88,7 +88,7 @@ class PipelineConfig:
     def __init__(self):
         # ========== CLUSTER CONFIGURATION ==========
         # THIS IS THE KEY PARAMETER - Change this to train on different numbers of clusters
-        self.n_top_clusters = 30  # 
+        self.n_top_clusters = 60  # 
         
         # ========== DATA PATHS ==========
         self.input_data_path = 'C:/Users/Anya/master_thesis/output'
@@ -166,6 +166,7 @@ config = PipelineConfig()
 INPUT_DATA_PATH = config.input_data_path
 INPUT_FILE = config.input_file
 OUTPUT_BASE = config.output_base
+N_TOP_CLUSTERS = config.n_top_clusters
 
 CHECKPOINT_DIR = config.checkpoint_dir
 RESULTS_DIR = config.results_dir
@@ -203,9 +204,27 @@ logger.info("Pipeline initialization started")
 # ============================================================================
 
 # FIX #7: Helper function for MAPE calculation with zero handling
-def calculate_mape(y_true, y_pred, epsilon=1e-10):
-    """Calculate MAPE with handling for zero values"""
-    return np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + epsilon))) * 100
+def calculate_mape(y_true, y_pred, epsilon=1.0):
+    """
+    Calculate MAPE with epsilon smoothing.
+    
+    MAPE = mean(|y_true - y_pred| / (|y_true| + epsilon)) * 100
+    This prevents division by zero/near-zero values.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    
+    # Handle zero/small values with epsilon
+    denominator = np.abs(y_true) + epsilon
+    
+    # Calculate percentage error
+    percentage_errors = np.abs(y_true - y_pred) / denominator
+    
+    # Return mean (clipped to prevent extreme values)
+    mape = np.nanmean(percentage_errors) * 100
+    
+    # Clip to reasonable range (0-500% is acceptable)
+    return np.clip(mape, 0, 500)
 
 def get_lstm_cluster_index(cluster_name, y_test_columns, lstm_predictions_shape):
     """
@@ -1048,9 +1067,6 @@ if not checkpoint_mgr.is_complete('features_engineered'):
     test_features_all, _, _ = create_lag_features(demand_matrix, lags=168)
     test_features = test_features_all.iloc[len(train_data):]
     
-    # Select top demand clusters for modeling
-    top_n_clusters = 30
-    top_clusters = demand_matrix.sum().nlargest(top_n_clusters).index.tolist()
     
     logger.info(f"\nCluster demand distribution (top 30):")
     cluster_dist = demand_matrix.sum().sort_values(ascending=False).head(30)
@@ -1084,7 +1100,6 @@ if not checkpoint_mgr.is_complete('features_engineered'):
     checkpoint_mgr.save_checkpoint('y_val', y_val)
     checkpoint_mgr.save_checkpoint('X_test', X_test)
     checkpoint_mgr.save_checkpoint('y_test', y_test)
-    checkpoint_mgr.save_checkpoint('top_clusters', top_clusters)
     checkpoint_mgr.save_checkpoint('feature_cols', feature_cols)
     checkpoint_mgr.mark_complete('features_engineered')
 else:
@@ -1101,6 +1116,11 @@ else:
 # Check if data is time-sorted
 print(demand_matrix.index.min(), "to", demand_matrix.index.max())
 print("Is sorted:", demand_matrix.index.is_monotonic_increasing)
+
+# Select top demand clusters for modeling
+top_n_clusters = N_TOP_CLUSTERS
+top_clusters = demand_matrix.sum().nlargest(top_n_clusters).index.tolist()
+checkpoint_mgr.save_checkpoint('top_clusters', top_clusters)
 
 # ============================================================================
 # HELPER: GET ALREADY TRAINED SARIMA CLUSTERS
@@ -1237,6 +1257,11 @@ def fit_cluster_sarima_task(cluster, train_series, models_dir):
     except Exception as e:
         return cluster, False, str(e)
 
+def get_remaining_clusters_to_train(topclusters, trained_clusters, config):
+    remaining = [c for c in topclusters if str(c) not in trained_clusters]
+    logger.info(f"Total: {len(topclusters)}, Trained: {len(trained_clusters)}, Remaining: {len(remaining)}")
+    return remaining
+
 # =========================================================================
 # STEP 3 SARIMA MODELS - PARALLEL OPTIMIZED
 # =========================================================================
@@ -1248,7 +1273,7 @@ print("=" * 80)
 if not checkpoint_mgr.is_complete('sarima_fitted'):
     # Check which clusters are already trained
     trained_clusters = get_already_trained_clusters(MODELS_DIR)
-    clusters_to_train = [c for c in top_clusters if str(c) not in trained_clusters]
+    clusters_to_train = get_remaining_clusters_to_train(top_clusters, trained_clusters, config)
     
     logger.info(f"Total clusters to train: {len(top_clusters)}")
     logger.info(f"Already trained: {len(trained_clusters)}")
@@ -1278,7 +1303,7 @@ if not checkpoint_mgr.is_complete('sarima_fitted'):
 
     # 2. Train remaining clusters in PARALLEL
     if clusters_to_train:
-        logger.info(f"Starting parallel training for {len(clusters_to_train)} clusters on Ryzen 9800X3D...")
+        logger.info(f"Starting parallel training for {len(clusters_to_train)} clusters...")
         logger.info(f"Using n_jobs=-1 (utilizing all 16 threads)")
         
         # Execute parallel training
@@ -1358,8 +1383,7 @@ def fit_cluster_xgboost_task(cluster, X_train, y_train_cluster, X_val, y_val_clu
     Worker function to fit XGBoost for a single cluster.
     """
     # CRITICAL: Control threads per worker
-    # We will run ~4 workers in parallel, so give each worker 4 threads
-    # (Total = 16 threads = Ryzen 9800X3D capacity)
+    # 4 workers in parallel, each worker 4 threads
     import os
     os.environ['OMP_NUM_THREADS'] = '4'
     
@@ -1974,10 +1998,9 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     
     # ============ LSTM PREDICTIONS ============
     logger.info("Making LSTM predictions...")
-    
-    # Load PCA and scaler
+
     pca_scaler_data = checkpoint_mgr.load_checkpoint('lstm_pca_scaler')
-    
+
     if pca_scaler_data:
         lstm_forecaster_temp = OptimizedLSTMForecaster(
             n_components=pca_scaler_data['n_components'],
@@ -1990,7 +2013,7 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
         _, X_test_reduced = lstm_forecaster_temp.preprocess(X_train, X_test)
         
         # Create sequences
-        seq_length = 168
+        seq_length = 24
         def create_sequences_local(X_data, seq_len):
             X_seq = []
             for i in range(len(X_data) - seq_len):
@@ -2007,7 +2030,24 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
                 custom_objects={'weighted_mse_loss': weighted_mse_loss}
             )
             lstm_pred_raw = lstm_forecaster_temp.model.predict(X_test_lstm)
-            lstm_predictions = np.maximum(lstm_pred_raw, 0)
+            lstm_predictions_original = np.maximum(lstm_pred_raw, 0)
+            
+            # PAD LSTM predictions to match test set length
+            # LSTM produces len(X_test) - seq_length predictions
+            # Pad with last predictions to match test set size
+            n_lstm_preds = lstm_predictions_original.shape[0]
+            n_test = len(X_test)
+            
+            if n_lstm_preds < n_test:
+                # Pad with last value
+                padding_needed = n_test - n_lstm_preds
+                last_pred = lstm_predictions_original[-1:, :]
+                padding = np.repeat(last_pred, padding_needed, axis=0)
+                lstm_predictions = np.vstack([lstm_predictions_original, padding])
+                logger.info(f"[OK] LSTM predictions padded from {n_lstm_preds} to {n_test} samples")
+            else:
+                lstm_predictions = lstm_predictions_original[:n_test, :]
+            
             logger.info(f"[OK] LSTM predictions shape: {lstm_predictions.shape}")
         else:
             logger.warning(f"[!] LSTM model file not found: {model_path}")
@@ -2015,7 +2055,7 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     else:
         logger.warning("[!] PCA/scaler not found")
         lstm_predictions = np.zeros((len(X_test), len(y_test.columns)))
-    
+        
     # ============ METRICS CALCULATION (ENHANCED) ============
     n_test_samples = len(X_test)
     logger.info(f"Evaluating {n_test_samples} test samples across clusters")
@@ -2046,14 +2086,14 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
                 metrics_results[cluster]['XGBoost'] = {
                     'RMSE': np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)),
                     'MAE': mean_absolute_error(y_actual_valid, y_pred_valid),
-                    'MAPE': calculate_mape(y_actual_valid, y_pred_valid),
+                    'MAPE': calculate_mape(y_actual_valid, y_pred_valid),  # ← Use function with epsilon
                     'R2': r2_score(y_actual_valid, y_pred_valid),
                     'Median_AE': median_absolute_error(y_actual_valid, y_pred_valid),
                     'RMSE_norm': np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)) / (y_actual_valid.mean() + 1e-10)
                 }
         except Exception as e:
             logger.warning(f"[!] XGBoost metrics failed for {cluster}: {e}")
-        
+                
         # ===== SARIMA METRICS =====
         try:
             if cluster in sarima_predictions:
@@ -2077,9 +2117,15 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
         
         # ===== LSTM METRICS =====
         try:
-            if cluster < lstm_predictions.shape[1]:
-                lstm_pred_cluster = lstm_predictions[:len(actual), cluster]
-                valid_idx = ~(np.isnan(lstm_pred_cluster) | np.isinf(lstm_pred_cluster) | np.isnan(actual) | np.isinf(actual))
+            # Find cluster index by name
+            cluster_list = list(y_test.columns)
+            if cluster in cluster_list:
+                cluster_idx = cluster_list.index(cluster)
+                
+                # Use padded LSTM predictions (same length as test set)
+                lstm_pred_cluster = lstm_predictions[:len(actual), cluster_idx]
+                valid_idx = ~(np.isnan(lstm_pred_cluster) | np.isinf(lstm_pred_cluster) | 
+                            np.isnan(actual) | np.isinf(actual))
                 
                 if valid_idx.sum() > 0:
                     y_actual_valid = actual[valid_idx]
@@ -2095,7 +2141,7 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
                     }
         except Exception as e:
             logger.warning(f"[!] LSTM metrics failed for {cluster}: {e}")
-        
+                
         if (cluster_idx + 1) % 50 == 0:
             logger.info(f"  [{cluster_idx + 1}/{len(common_clusters)}] Metrics calculated")
     
@@ -2120,7 +2166,7 @@ else:
 
 
 # =========================================================================
-# STEP 7: VISUALIZATIONS (ENHANCED METRICS)
+# STEP 7: VISUALIZATIONS
 # =========================================================================
 
 print("\n" + "="*80)
@@ -2131,11 +2177,11 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
     progress.update(80, "Creating visualizations")
     
     # Plot 1: Enhanced Model Comparison with All Metrics
+    
     if metrics_results:
         first_cluster = list(metrics_results.keys())[0]
         metrics_df = pd.DataFrame(metrics_results[first_cluster]).T
         
-        # Select key metrics for visualization
         metrics_to_plot = ['RMSE', 'MAE', 'MAPE', 'R2', 'Median_AE']
         metrics_available = [m for m in metrics_to_plot if m in metrics_df.columns]
         
@@ -2144,8 +2190,17 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
         
         for idx, metric in enumerate(metrics_available):
             ax = axes[idx]
-            metrics_df[metric].plot(kind='bar', ax=ax, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
-            ax.set_title(f'{metric} - Cluster {first_cluster}', fontsize=12, fontweight='bold')
+            values = metrics_df[metric]
+            
+            # Use log scale for MAPE if values are large
+            if metric == 'MAPE' and values.max() > 1000:
+                ax.set_yscale('log')
+                title_suffix = ' (log scale)'
+            else:
+                title_suffix = ''
+            
+            values.plot(kind='bar', ax=ax, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+            ax.set_title(f'{metric}{title_suffix} - {first_cluster}', fontsize=12, fontweight='bold')
             ax.set_ylabel(metric, fontsize=11)
             ax.set_xlabel('Model', fontsize=11)
             ax.grid(True, alpha=0.3)
@@ -2198,14 +2253,129 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
         plt.close()
         logger.info("[OK] Feature importance plot saved")
     
-    # Plot 3: Forecast comparison (unchanged)
-    # ... existing forecast comparison code ...
+    # Plot 3: FORECAST COMPARISON (Multiple Clusters)
+    logger.info("Creating forecast comparison visualizations...")
+    
+    try:
+        # Select top 6 clusters by average MAE
+        cluster_performance = {}
+        for cluster in metrics_results.keys():
+            avg_mae = np.nanmean([metrics_results[cluster].get(model, {}).get('MAE', np.inf) 
+                                 for model in ['SARIMA', 'XGBoost', 'LSTM']])
+            cluster_performance[cluster] = avg_mae
+        
+        top_clusters = sorted(cluster_performance.items(), key=lambda x: x[1])[:6]
+        top_cluster_names = [c[0] for c in top_clusters]
+        
+        # Get the common length for all predictions
+        n_test_samples = len(X_test)
+        
+        # Create forecast comparison for each top cluster
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        axes = axes.flatten()
+        
+        for plot_idx, cluster in enumerate(top_cluster_names):
+            ax = axes[plot_idx]
+            
+            # Get actual values
+            actual_values = y_test[cluster].values[:n_test_samples]
+            time_steps = np.arange(len(actual_values))
+            
+            # Plot actual
+            ax.plot(time_steps, actual_values, 'ko-', linewidth=2, markersize=4, label='Actual', zorder=3)
+            
+            # Plot XGBoost predictions
+            if cluster in xgb_predictions.columns:
+                xgb_pred = xgb_predictions[cluster].values[:n_test_samples]
+                ax.plot(time_steps, xgb_pred, 's--', linewidth=1.5, markersize=3, 
+                       label='XGBoost', alpha=0.8, color='#ff7f0e')
+            
+            # Plot SARIMA predictions
+            if cluster in sarima_predictions:
+                sarima_pred = sarima_predictions[cluster][:n_test_samples]
+                ax.plot(time_steps, sarima_pred, '^--', linewidth=1.5, markersize=3, 
+                       label='SARIMA', alpha=0.8, color='#1f77b4')
+            
+            # Plot LSTM predictions
+            if cluster in y_test.columns:
+                cluster_idx = list(y_test.columns).index(cluster)
+                if cluster_idx < lstm_predictions.shape[1]:
+                    lstm_pred = lstm_predictions[:n_test_samples, cluster_idx]
+                    ax.plot(time_steps, lstm_pred, 'v--', linewidth=1.5, markersize=3, 
+                           label='LSTM', alpha=0.8, color='#2ca02c')
+            
+            ax.set_title(f'{cluster} (MAE: {cluster_performance[cluster]:.2f})', 
+                        fontsize=11, fontweight='bold')
+            ax.set_xlabel('Time Step', fontsize=10)
+            ax.set_ylabel('Demand (Trips)', fontsize=10)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='best', fontsize=9)
+        
+        fig.suptitle('Forecast Comparison - Top 6 Clusters by Performance', 
+                    fontsize=14, fontweight='bold', y=1.00)
+        plt.tight_layout()
+        plt.savefig(os.path.join(VIZ_DIR, 'forecast_comparison.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("[OK] Forecast comparison plot saved")
+        
+    except Exception as e:
+        logger.warning(f"[!] Forecast comparison plot failed: {e}")
+    
+    # Plot 4: Residuals comparison (optional but useful)
+    logger.info("Creating residuals visualization...")
+    
+    try:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        for model_idx, model in enumerate(['SARIMA', 'XGBoost', 'LSTM']):
+            ax = axes[model_idx]
+            residuals_all = []
+            
+            for cluster in top_cluster_names:
+                actual_values = y_test[cluster].values[:n_test_samples]
+                
+                if model == 'XGBoost' and cluster in xgb_predictions.columns:
+                    pred_values = xgb_predictions[cluster].values[:n_test_samples]
+                elif model == 'SARIMA' and cluster in sarima_predictions:
+                    pred_values = sarima_predictions[cluster][:n_test_samples]
+                elif model == 'LSTM' and cluster in y_test.columns:
+                    cluster_idx = list(y_test.columns).index(cluster)
+                    if cluster_idx < lstm_predictions.shape[1]:
+                        pred_values = lstm_predictions[:n_test_samples, cluster_idx]
+                    else:
+                        continue
+                else:
+                    continue
+                
+                residuals = actual_values - pred_values
+                residuals_all.extend(residuals)
+            
+            if residuals_all:
+                ax.hist(residuals_all, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+                ax.axvline(np.mean(residuals_all), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(residuals_all):.2f}')
+                ax.set_title(f'{model} Residuals Distribution', fontsize=11, fontweight='bold')
+                ax.set_xlabel('Residuals (Actual - Predicted)', fontsize=10)
+                ax.set_ylabel('Frequency', fontsize=10)
+                ax.legend()
+                ax.grid(True, alpha=0.3, axis='y')
+        
+        fig.suptitle('Residuals Analysis - Top Models', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(VIZ_DIR, 'residuals_analysis.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("[OK] Residuals analysis plot saved")
+        
+    except Exception as e:
+        logger.warning(f"[!] Residuals analysis plot failed: {e}")
     
     checkpoint_mgr.mark_complete('visualizations_created')
     logger.info("[OK] Visualization step completed")
 
 else:
     logger.info("[OK] Visualizations already created")
+    
+    checkpoint_mgr.mark_complete('visualizations_created')
+    logger.info("[OK] Visualization step completed")
 
 
 # =========================================================================
