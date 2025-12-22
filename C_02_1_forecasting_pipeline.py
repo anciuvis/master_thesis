@@ -17,6 +17,7 @@ import logging
 import joblib
 from datetime import datetime
 from typing import Dict, Tuple, Optional
+from itertools import product
 
 import numpy as np
 import pandas as pd
@@ -29,12 +30,14 @@ from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tools.sm_exceptions import ValueWarning
+from pmdarima import auto_arima
 
 # Multiprocessing
 from joblib import Parallel, delayed
 from multiprocessing import cpu_count
 from multiprocessing import get_context
 import psutil
+import multiprocessing as mp
 
 # Machine Learning
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
@@ -71,12 +74,12 @@ except ImportError:
     SHAP_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
-plt.style.use('seaborn-v0_8-darkgrid')
-sns.set_palette("husl")
-
-# Suppress specific statsmodels warnings
+# Silence warnings inside the worker process
 warnings.simplefilter('ignore', category=ValueWarning)
 warnings.simplefilter('ignore', category=FutureWarning)
+warnings.simplefilter('ignore', category=UserWarning)
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
 
 # ============================================================================
 # CONFIGURATION - KEY PARAMETER: N_TOP_CLUSTERS
@@ -88,8 +91,8 @@ class PipelineConfig:
     def __init__(self):
         # ========== CLUSTER CONFIGURATION ==========
         # THIS IS THE KEY PARAMETER - Change this to train on different numbers of clusters
-        self.n_top_clusters = 60  # 
-        
+        self.n_top_clusters = 90
+
         # ========== DATA PATHS ==========
         self.input_data_path = 'C:/Users/Anya/master_thesis/output'
         self.input_file = 'taxi_data_cleaned_full_with_clusters.parquet'
@@ -101,15 +104,15 @@ class PipelineConfig:
         self.viz_dir = os.path.join(self.output_base, 'visualizations')
         self.log_dir = os.path.join(self.output_base, 'logs')
         self.models_dir = os.path.join(self.output_base, 'models')
-        
+
         # ========== FEATURE ENGINEERING ==========
         self.lag_features = 168  # 7 days of hourly data
-        self.seq_length = 168  # LSTM sequence length (168 hours)
-        
+        self.seq_length = 168  # LSTM sequence length
+
         # ========== DATA SPLITTING ==========
         self.test_size = 0.2
         self.val_size = 0.1
-        
+
         # ========== XGBOOST HYPERPARAMETERS ==========
         self.xgb_grid_type = 'quick'  # 'quick', 'medium', 'full'
         self.xgb_default_params = {
@@ -120,22 +123,30 @@ class PipelineConfig:
             'subsample': 0.8,
             'colsample_bytree': 0.8
         }
-        
+
         # ========== LSTM ARCHITECTURE ==========
         self.lstm_n_components = 256  # PCA reduction dimension
-        self.lstm_units = 256
-        self.lstm_epochs = 100
+        self.lstm_units = 512
+        self.lstm_epochs = 200
         self.lstm_batch_size = 16
-        
+        self.lstm_layers = 3    # Add 3rd LSTM layer
+        self.dropout = 0.3      # Stronger regularization
+
         # ========== SARIMA PARAMETERS ==========
-        self.sarima_order = (0, 1, 1)  # Differencing + MA, no AR
-        self.sarima_seasonal_order = (0, 1, 1, 168)  # Seasonal MA only
-        self.sarima_maxiter = 100  # Reduced iterations
-        
+        # self.sarima_order = (0, 1, 1)  # Differencing + MA, no AR
+        self.sarima_order = (0, 1, 0)
+        self.sarima_seasonal_order = (0, 1, 0, 168)
+        # self.sarima_seasonal_order = (1, 1, 0, 168) # Keep seasonal AR for day-of-week, minimal D
+        # self.sarima_maxiter = 100
+        self.sarima_maxiter = 50  # Reduced iterations
+        self.use_pmdarima = True
+
+
+
         # Create output directories
         for d in [self.checkpoint_dir, self.results_dir, self.viz_dir, self.log_dir, self.models_dir]:
             os.makedirs(d, exist_ok=True)
-    
+
     def get_summary(self):
         """Print configuration summary"""
         return f"""
@@ -173,6 +184,10 @@ RESULTS_DIR = config.results_dir
 VIZ_DIR = config.viz_dir
 LOG_DIR = config.log_dir
 MODELS_DIR = config.models_dir
+
+SARIMA_ORDER = config.sarima_order
+SARIMA_SEASON_ORDER = config.sarima_seasonal_order
+SARIMA_MAXITER = config.sarima_maxiter
 
 # Logging
 log_file = os.path.join(LOG_DIR, f'integrated_pipeline_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
@@ -213,16 +228,16 @@ def calculate_mape(y_true, y_pred, epsilon=1.0):
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
-    
+
     # Handle zero/small values with epsilon
     denominator = np.abs(y_true) + epsilon
-    
+
     # Calculate percentage error
     percentage_errors = np.abs(y_true - y_pred) / denominator
-    
+
     # Return mean (clipped to prevent extreme values)
     mape = np.nanmean(percentage_errors) * 100
-    
+
     # Clip to reasonable range (0-500% is acceptable)
     return np.clip(mape, 0, 500)
 
@@ -415,7 +430,7 @@ def add_temporal_features(demand_matrix: pd.DataFrame) -> pd.DataFrame:
     """Add temporal features"""
     logger.info("Adding temporal features...")
     progress.update(12, "Creating temporal features")
-    
+
     df = demand_matrix.copy()
     df['hour'] = df.index.hour
     df['day_of_week'] = df.index.dayofweek
@@ -423,13 +438,13 @@ def add_temporal_features(demand_matrix: pd.DataFrame) -> pd.DataFrame:
     df['month'] = df.index.month
     df['is_weekend'] = (df.index.dayofweek >= 5).astype(int)
     df['is_rush_hour'] = df['hour'].isin([7, 8, 9, 17, 18, 19]).astype(int)
-    
+
     # Cyclical encoding
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
     df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
-    
+
     return df
 
 
@@ -437,18 +452,18 @@ def create_lag_features(data: pd.DataFrame, lags: int = 168) -> pd.DataFrame:
     """Create lag features for XGBoost and LSTM"""
     logger.info(f"Creating lag features (lags={lags})...")
     progress.update(14, f"Creating {lags} lag features")
-    
+
     df = data.copy()
-    
+
     # Identify demand columns (exclude temporal features)
     temporal_feature_cols = [
         'hour', 'day_of_week', 'day_of_month', 'month', 'is_weekend', 
         'is_rush_hour', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos'
     ]
     demand_cols = [col for col in data.columns if col not in temporal_feature_cols]
-    
+
     logger.info(f"Found {len(demand_cols)} demand columns, {len(temporal_feature_cols)} temporal features")
-    
+
     # Create lags for each cluster
     for col in demand_cols:
         # single integer or list of lags
@@ -456,18 +471,18 @@ def create_lag_features(data: pd.DataFrame, lags: int = 168) -> pd.DataFrame:
             lag_list = lags
         else:
             lag_list = list(range(1, lags + 1))
-        
+
         for lag in lag_list:
             df[f'{col}_lag_{lag}'] = data[col].shift(lag)
-        
+
     # Rolling statistics
     for col in demand_cols:
         df[f'{col}_rolling_mean_6'] = data[col].shift(1).rolling(window=6).mean()
         df[f'{col}_rolling_std_6'] = data[col].shift(1).rolling(window=6).std()
         df[f'{col}_rolling_mean_24'] = data[col].shift(1).rolling(window=24).mean()
-    
+
     df = df.dropna()
-    
+
     logger.info(f"Feature matrix shape after lags: {df.shape}")
     return df, demand_cols, temporal_feature_cols
 
@@ -477,17 +492,17 @@ def create_train_val_test_split(demand_matrix: pd.DataFrame,
     """Create temporal splits"""
     logger.info("Creating temporal data splits...")
     progress.update(16, "Splitting data (train/val/test)")
-    
+
     n = len(demand_matrix)
     train_end = int(n * (1 - test_size - val_size))
     val_end = int(n * (1 - test_size))
-    
+
     train = demand_matrix.iloc[:train_end]
     validation = demand_matrix.iloc[train_end:val_end]
     test = demand_matrix.iloc[val_end:]
-    
+
     logger.info(f"Train: {len(train)} | Val: {len(validation)} | Test: {len(test)}")
-    
+
     return train, validation, test
 
 
@@ -497,7 +512,7 @@ def create_train_val_test_split(demand_matrix: pd.DataFrame,
 
 class SARIMAPredictor:
     """SARIMA wrapper with memory-efficient fallback strategies"""
-    
+
     def __init__(self, cluster_name: str):
         self.cluster_name = cluster_name
         self.model = None
@@ -505,106 +520,48 @@ class SARIMAPredictor:
         self.fitted = False
         self.train_data = None
         self.strategy = None
-    
-    def fit(self, train_data: pd.Series, order=(1,1,1), seasonal_order=(1,1,1,168)):
+
+    def fit(self, train_data: pd.Series, order=SARIMA_ORDER, seasonal_order=SARIMA_SEASON_ORDER, maxiter=SARIMA_MAXITER):
         """
         Fit SARIMA with memory-efficient strategies optimized for weekly seasonality.
-        
-        Key insight: We want to PRESERVE weekly patterns (168h lag) but reduce 
-        memory footprint. Use (0,1,1,168) or (1,0,1,168) instead of (1,1,1,168).
-        """
-        
-        strategies = [
-            # STRATEGY 1: Seasonal MA only (most memory-efficient while preserving seasonality)
-            # This captures seasonal shocks without seasonal differencing
-            {
-                'name': 'Seasonal MA Only (0,1,1,168)',
-                'order': (0, 1, 1),  # Non-seasonal: only MA term
-                'seasonal_order': (0, 1, 1, 168)  # Seasonal: only MA, no AR
-            },
+        """        
+        try:
+            gc.collect()
+
+            self.model = SARIMAX(
+                train_data,
+                order=order,
+                seasonal_order=seasonal_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+                disp=False,
+                measurement_error=True,  # Reduces numerical issues
+                error_cov_type='diagonal'  # Simpler covariance structure
+            )
             
-            # STRATEGY 2: Reduced seasonal order with just seasonal differencing
-            # Uses (1,0,1,168) - simpler state space
-            {
-                'name': 'Reduced Seasonal (1,0,1,168)',
-                'order': (1, 1, 0),  # Non-seasonal AR + differencing
-                'seasonal_order': (1, 0, 1, 168)  # Seasonal AR only
-            },
+            self.results = self.model.fit(
+                disp=False,
+                maxiter=maxiter,
+                low_memory=True,
+                method='lbfgs',  # Explicitly set (default)
+                start_params=None,
+                transform_params=True
+            )
             
-            # STRATEGY 3: Even more reduced - only capture 24h patterns + seasonal MA
-            # Instead of (1,1,1,168), use subset of lags
-            {
-                'name': 'Memory-Light Seasonal (0,1,1,24)',
-                'order': (0, 1, 1),
-                'seasonal_order': (0, 1, 1, 24)  # Daily seasonality instead of weekly
-            },
+            self.fitted = True
+            logger.info(f"[OK] SARIMA fitted, AIC={self.results.aic:.2f}")
+            return self.results
             
-            # STRATEGY 4: Simple exponential smoothing via ARIMA
-            # No seasonality, just capture trend + noise
-            {
-                'name': 'Simple ARIMA (1,1,1)',
-                'order': (1, 1, 1),
-                'seasonal_order': None
-            },
+        except MemoryError as e:
+            logger.warning(f"[FALLBACK] failed - MemoryError: {str(e)[:100]}")
+            gc.collect()
+
             
-            # STRATEGY 5: Last resort - basic differencing
-            {
-                'name': 'Basic AR (1,0,0)',
-                'order': (1, 0, 0),
-                'seasonal_order': None
-            },
-        ]
+        except Exception as e:
+            logger.warning(f"[FALLBACK] failed - {type(e).__name__}: {str(e)[:80]}")
+            gc.collect()
+
         
-        for strategy in strategies:
-            try:
-                gc.collect()
-                logger.info(f"[{self.cluster_name}] Attempting: {strategy['name']}")
-                
-                if strategy['seasonal_order'] is None:
-                    from statsmodels.tsa.arima.model import ARIMA
-                    self.model = ARIMA(
-                        train_data,
-                        order=strategy['order'],
-                        enforce_stationarity=False,
-                        enforce_invertibility=False
-                    )
-                else:
-                    self.model = SARIMAX(
-                        train_data,
-                        order=strategy['order'],
-                        seasonal_order=strategy['seasonal_order'],
-                        enforce_stationarity=False,
-                        enforce_invertibility=False,
-                        disp=False,
-                        # MEMORY OPTIMIZATION: Kalman filter options
-                        measurement_error=True,  # Reduces numerical issues
-                        error_cov_type='diagonal'  # Simpler covariance structure
-                    )
-                
-                # Fit with REDUCED iterations (200 is too aggressive)
-                self.results = self.model.fit(
-                    disp=False,
-                    maxiter=100,  # Reduced from 200 to 100
-                    low_memory=True  # Enable low-memory mode if available
-                )
-                
-                self.fitted = True
-                self.strategy = strategy['name']
-                logger.info(f"[OK] SARIMA fitted ({strategy['name']}): AIC={self.results.aic:.2f}")
-                return self.results
-                
-            except MemoryError as e:
-                logger.warning(f"[FALLBACK] {strategy['name']} failed - MemoryError: {str(e)[:100]}")
-                gc.collect()
-                continue
-                
-            except Exception as e:
-                logger.warning(f"[FALLBACK] {strategy['name']} failed - {type(e).__name__}: {str(e)[:80]}")
-                gc.collect()
-                continue
-        
-        logger.error(f"[X] {self.cluster_name}: All fitting strategies failed")
-        return None
     
     def forecast(self, steps: int):
         """Generate forecasts"""
@@ -1195,73 +1152,176 @@ def get_already_trained_lstm_checkpoint() -> bool:
     return False
 
 # ============================================================================
-# HELPER: PARALLEL SARIMA TASK (FIXED WARNINGS)
+# HELPER: PARALLEL SARIMA TASK
 # ============================================================================
 def fit_cluster_sarima_task(cluster, train_series, models_dir):
     """
     Worker function to fit SARIMA for a single cluster in parallel.
+    Uses proven (0,1,1,168) Seasonal MA Only specification.
     Saves model to disk immediately to save RAM.
+    
+    Based on successful implementation that trained 30 clusters in ~2 hours.
     """
+    import os
+    import warnings
+    import gc
+    import joblib
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    from statsmodels.tools.sm_exceptions import ValueWarning
+    
     # CRITICAL: Prevent oversubscription
     os.environ['OMP_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
-    
+
     # Silence warnings inside the worker process
-    import warnings
-    from statsmodels.tools.sm_exceptions import ValueWarning
     warnings.simplefilter('ignore', category=ValueWarning)
     warnings.simplefilter('ignore', category=FutureWarning)
     warnings.simplefilter('ignore', category=UserWarning)
 
     try:
         # ENSURE FREQUENCY IS SET
-        # This fixes: "A date index has been provided, but it has no associated frequency information"
         if train_series.index.freq is None:
-            train_series = train_series.asfreq('H')
-            
-        # Instantiate predictor
-        predictor = SARIMAPredictor(str(cluster))
+            train_series = train_series.asfreq('h')
+
+        # Use proven (0,1,1,168) specification: Seasonal MA Only
+        # This captures weekly seasonal shocks without being memory-intensive
+        # AIC values from successful run: 17,000-18,000 range
         
-        # --- FIXED FIT METHOD CALL ---
-        # We manually perform the fitting here to avoid passing deprecated args 
-        # that were inside the original predictor.fit() method
+        gc.collect()
         
-        # Define strategy: Seasonal MA Only (0,1,1,168) - Memory Efficient
-        try:
-            model = SARIMAX(
-                train_series,
-                order=(0, 1, 1),
-                seasonal_order=(0, 1, 1, 168),
-                enforce_stationarity=False,
-                enforce_invertibility=False,
-                # REMOVED deprecated args: measurement_error, error_cov_type
-            )
-            
-            results = model.fit(
-                disp=False, 
-                maxiter=100,
-                low_memory=True
-            )
-            
-            # Save to disk
-            save_path = os.path.join(models_dir, f'sarima_model_{cluster}.pkl')
-            joblib.dump(results, save_path)
-            
-            return cluster, True, results.aic
-            
-        except Exception as e:
-            # fast fallback to simple ARIMA if seasonal fails
-             return cluster, False, str(e)
+        model = SARIMAX(
+            train_series,
+            order=(0, 1, 1),              # Non-seasonal: differencing + MA only
+            seasonal_order=(0, 1, 1, 168), # Seasonal: differencing + MA only (NO AR)
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+
+        results = model.fit(
+            disp=False, 
+            maxiter=100,
+            low_memory=True
+        )
+
+        # Save to disk immediately
+        save_path = os.path.join(models_dir, f'sarima_model_{cluster}.pkl')
+        joblib.dump(results, save_path)
+
+        gc.collect()
+        return cluster, True, results.aic
 
     except Exception as e:
         return cluster, False, str(e)
+
 
 def get_remaining_clusters_to_train(topclusters, trained_clusters, config):
     remaining = [c for c in topclusters if str(c) not in trained_clusters]
     logger.info(f"Total: {len(topclusters)}, Trained: {len(trained_clusters)}, Remaining: {len(remaining)}")
     return remaining
 
+def fit_cluster_pmdarima_task(cluster, train_series, models_dir):
+    """
+    Worker function to fit SARIMA using pmdarima.auto_arima for a single cluster.
+    Auto-selects order and seasonal order via stepwise search.
+    Handles NaN values and uses data windowing for memory efficiency.
+    Saves model to disk immediately to save RAM.
+    
+    Parameters
+    ----------
+    cluster : str
+        Cluster identifier (e.g., '123' or 'T2S60')
+    train_series : pd.Series
+        Time series for this cluster with hourly frequency
+    models_dir : str
+        Directory where to save fitted model pickle
+    
+    Returns
+    -------
+    tuple
+        (cluster_name, success_bool, aic_or_error_msg)
+    """
+    import os
+    import warnings
+    import joblib
+    import numpy as np
+    from pmdarima import auto_arima
+    
+    # Prevent thread oversubscription
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    warnings.filterwarnings('ignore')
+    
+    try:
+        # Ensure hourly frequency
+        if train_series.index.freq is None:
+            train_series = train_series.asfreq('h')
+        
+        # Handle NaN values: forward fill then backward fill
+        train_series = train_series.fillna(method='ffill').fillna(method='bfill')
+        
+        # Remove any remaining NaN values
+        train_series = train_series.dropna()
+        
+        # Check if series is empty after NaN removal
+        if len(train_series) == 0:
+            return cluster, False, "Series is empty after NaN removal"
+        
+        # Check for constant series (no variance)
+        if train_series.std() == 0:
+            return cluster, False, "Series is constant (zero variance)"
+        
+        # Recent data captures current seasonality patterns better than old data
+        max_hours = 4320  # 6 months * 30 days * 24 hours
+        if len(train_series) > max_hours:
+            train_series = train_series.iloc[-max_hours:]
+        
+        # Auto-fit SARIMA with optimized settings for NYC taxi hourly data
+        model = auto_arima(
+            train_series,
+            seasonal=True,            # Enable seasonal component
+            m=168,                    # Weekly seasonality (7 days * 24 hours)
+            
+            # ARIMA (p, d, q) parameters - conservative to reduce matrix size
+            start_p=0,                # Start AR search at 0
+            max_p=2,                  # Max AR order (search 0, 1, 2)
+            start_d=1,                # Start differencing at 1
+            max_d=2,                  # Max differencing (search 1, 2)
+            start_q=0,                # Start MA search at 0
+            max_q=2,                  # Max MA order (search 0, 1, 2)
+            
+            # Seasonal ARIMA (P, D, Q, m) parameters
+            start_P=0,                # Start seasonal AR at 0
+            max_P=0,                  # REDUCED: No seasonal AR (saves matrix size)
+            start_D=1,                # Start seasonal diff at 1
+            max_D=1,                  # Max seasonal differencing (fixed at 1)
+            start_Q=0,                # Start seasonal MA at 0
+            max_Q=1,                  # REDUCED: Max seasonal MA at 1 only (saves matrix size)
+            
+            # Search settings
+            stepwise=True,            # Efficient stepwise search
+            n_jobs=1,                 # MUST be 1 for stepwise
+            maxiter=100,              # Reduced from 150 for faster fitting
+            suppress_warnings=True,
+            error_action='ignore',    # Skip combinations that fail
+            trace=False               # No verbose output
+        )
+        
+        # Save model to disk immediately
+        save_path = os.path.join(models_dir, f"sarima_model_{cluster}.pkl")
+        joblib.dump(model, save_path)
+        
+        # Get AIC for logging
+        try:
+            aic = model.aic()
+        except:
+            aic = 0.0
+        
+        return cluster, True, aic
+        
+    except Exception as e:
+        return cluster, False, str(e)
 # =========================================================================
 # STEP 3 SARIMA MODELS - PARALLEL OPTIMIZED
 # =========================================================================
@@ -1304,17 +1364,16 @@ if not checkpoint_mgr.is_complete('sarima_fitted'):
     # 2. Train remaining clusters in PARALLEL
     if clusters_to_train:
         logger.info(f"Starting parallel training for {len(clusters_to_train)} clusters...")
-        logger.info(f"Using n_jobs=-1 (utilizing all 16 threads)")
         
         # Execute parallel training
         # n_jobs=-1 uses all available cores. 
         # backend='loky' is robust for statsmodels.
-        parallel_results = Parallel(n_jobs=-1, backend='loky', verbose=10)(
-            delayed(fit_cluster_sarima_task)(
-                cluster, 
-                train_data[cluster], 
-                MODELS_DIR
-            ) for cluster in clusters_to_train
+        logger.info("Using statsmodels SARIMA (0,1,1)x(0,1,1,168) - Seasonal MA Only")
+        worker_func = fit_cluster_sarima_task
+
+        parallel_results = Parallel(n_jobs=2, backend='loky', verbose=10)(
+            delayed(worker_func)(cluster, train_data[cluster], MODELS_DIR)
+            for cluster in clusters_to_train
         )
         
         # Process results
@@ -2173,6 +2232,181 @@ print("\n" + "="*80)
 print("STEP 7: VISUALIZATIONS")
 print("="*80)
 
+def create_individual_forecast_plots(
+    top_clusters,
+    y_test,
+    sarima_predictions,
+    xgb_predictions,
+    lstm_predictions,
+    output_dir='./visualizations/forecast_individual'
+):
+    """
+    Create INDIVIDUAL forecast comparison plots for each cluster.
+    Generates separate PNG file for each cluster (like your second screenshot).
+    
+    Parameters:
+    -----------
+    top_clusters : list
+        List of cluster names (e.g., ['T2_S60', 'T2_S22', 'T5_S31', ...])
+    
+    y_test : pd.DataFrame
+        Test actual values with shape (n_test_samples, n_clusters)
+        Columns must match cluster names
+    
+    sarima_predictions : dict or pd.DataFrame
+        SARIMA predictions. If dict: keys = cluster names
+        If DataFrame: columns = cluster names
+    
+    xgb_predictions : dict or pd.DataFrame
+        XGBoost predictions (same structure)
+    
+    lstm_predictions : np.ndarray or dict
+        LSTM predictions. If array: shape (n_samples, n_clusters)
+        If dict: keys = cluster names
+    
+    output_dir : str
+        Directory to save PNG files
+    
+    Returns:
+    --------
+    None (saves files to disk)
+    """
+    
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print(f"\n{'='*80}")
+    print(f"Creating individual forecast comparison plots...")
+    print(f"{'='*80}")
+    print(f"Output directory: {output_dir}")
+    print(f"Total clusters: {len(top_clusters)}\n")
+    
+    # Styling
+    plt.style.use('seaborn-v0_8-darkgrid')
+    sns.set_palette("husl")
+    
+    successful = 0
+    failed = 0
+    
+    # ================================================================
+    # LOOP THROUGH EACH CLUSTER
+    # ================================================================
+    for idx, cluster in enumerate(top_clusters, 1):
+        try:
+            # Extract actual values from y_test
+            if hasattr(y_test, 'columns'):  # DataFrame
+                if cluster not in y_test.columns:
+                    print(f"  [{idx:2d}/{len(top_clusters)}] [SKIP] {cluster}: Not in y_test")
+                    failed += 1
+                    continue
+                actual = y_test[cluster].values
+            else:  # NumPy array
+                actual = y_test[:, idx-1]
+            
+            # Extract SARIMA predictions
+            if isinstance(sarima_predictions, dict):
+                sarima_pred = sarima_predictions.get(cluster, None)
+            else:
+                sarima_pred = sarima_predictions[cluster].values if cluster in sarima_predictions.columns else None
+            
+            # Extract XGBoost predictions
+            if isinstance(xgb_predictions, dict):
+                xgb_pred = xgb_predictions.get(cluster, None)
+            else:
+                xgb_pred = xgb_predictions[cluster].values if cluster in xgb_predictions.columns else None
+            
+            # Extract LSTM predictions
+            if isinstance(lstm_predictions, dict):
+                lstm_pred = lstm_predictions.get(cluster, None)
+            elif isinstance(lstm_predictions, np.ndarray):
+                col_idx = list(y_test.columns).index(cluster)
+                lstm_pred = lstm_predictions[:, col_idx]
+            else:
+                lstm_pred = None
+            
+            # Skip if no predictions
+            if all(p is None for p in [sarima_pred, xgb_pred, lstm_pred]):
+                print(f"  [{idx:2d}/{len(top_clusters)}] [SKIP] {cluster}: No predictions")
+                failed += 1
+                continue
+            
+            # ================================================================
+            # CREATE PLOT
+            # ================================================================
+            fig, ax = plt.subplots(figsize=(14, 6))
+            
+            # First 100 timesteps
+            max_steps = min(100, len(actual))
+            time_steps = np.arange(max_steps)
+            actual_plot = actual[:max_steps]
+            
+            # Plot lines
+            ax.plot(time_steps, actual_plot, 'ko-', linewidth=2.5, markersize=4, 
+                   label='Actual', zorder=5)
+            
+            if sarima_pred is not None:
+                ax.plot(time_steps, sarima_pred[:max_steps], 'g--', linewidth=1.5, 
+                       alpha=0.8, label='SARIMA', zorder=3)
+            
+            if xgb_pred is not None:
+                ax.plot(time_steps, xgb_pred[:max_steps], 'b:', linewidth=2, 
+                       alpha=0.8, label='XGBoost', zorder=3)
+            
+            if lstm_pred is not None:
+                ax.plot(time_steps, lstm_pred[:max_steps], 'm-.', linewidth=1.5, 
+                       alpha=0.8, label='LSTM', zorder=3)
+            
+            # Formatting
+            ax.set_xlabel('Time Step', fontsize=12, fontweight='bold')
+            ax.set_ylabel('Demand (Trips)', fontsize=12, fontweight='bold')
+            ax.set_title(f'Forecast Comparison - Cluster {cluster} (First {max_steps} timesteps)', 
+                        fontsize=14, fontweight='bold', pad=15)
+            ax.legend(loc='upper left', fontsize=11, framealpha=0.95)
+            ax.grid(True, alpha=0.3, linestyle='--')
+            
+            # MAE statistics box
+            stats_lines = ["MAE:"]
+            if sarima_pred is not None:
+                mae = np.mean(np.abs(actual_plot - sarima_pred[:max_steps]))
+                stats_lines.append(f"SARIMA: {mae:.2f}")
+            if xgb_pred is not None:
+                mae = np.mean(np.abs(actual_plot - xgb_pred[:max_steps]))
+                stats_lines.append(f"XGBoost: {mae:.2f}")
+            if lstm_pred is not None:
+                mae = np.mean(np.abs(actual_plot - lstm_pred[:max_steps]))
+                stats_lines.append(f"LSTM: {mae:.2f}")
+            
+            ax.text(0.98, 0.97, "\n".join(stats_lines), transform=ax.transAxes,
+                   fontsize=10, verticalalignment='top', horizontalalignment='right',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            plt.tight_layout()
+            
+            # Save
+            filename = f"forecast_comparison_{cluster}.png"
+            filepath = os.path.join(output_dir, filename)
+            plt.savefig(filepath, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            print(f"  [{idx:2d}/{len(top_clusters)}] ✓ {filename}")
+            successful += 1
+            
+        except Exception as e:
+            print(f"  [{idx:2d}/{len(top_clusters)}] [ERROR] {cluster}: {str(e)[:50]}")
+            plt.close('all')
+            failed += 1
+    
+    # Summary
+    print(f"\n{'='*80}")
+    print(f"✓ Successful: {successful} | ✗ Failed: {failed}")
+    print(f"Saved to: {output_dir}")
+    print(f"{'='*80}\n")
+
 if not checkpoint_mgr.is_complete('visualizations_created'):
     progress.update(80, "Creating visualizations")
     
@@ -2256,71 +2490,14 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
     # Plot 3: FORECAST COMPARISON (Multiple Clusters)
     logger.info("Creating forecast comparison visualizations...")
     
-    try:
-        # Select top 6 clusters by average MAE
-        cluster_performance = {}
-        for cluster in metrics_results.keys():
-            avg_mae = np.nanmean([metrics_results[cluster].get(model, {}).get('MAE', np.inf) 
-                                 for model in ['SARIMA', 'XGBoost', 'LSTM']])
-            cluster_performance[cluster] = avg_mae
-        
-        top_clusters = sorted(cluster_performance.items(), key=lambda x: x[1])[:6]
-        top_cluster_names = [c[0] for c in top_clusters]
-        
-        # Get the common length for all predictions
-        n_test_samples = len(X_test)
-        
-        # Create forecast comparison for each top cluster
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        axes = axes.flatten()
-        
-        for plot_idx, cluster in enumerate(top_cluster_names):
-            ax = axes[plot_idx]
-            
-            # Get actual values
-            actual_values = y_test[cluster].values[:n_test_samples]
-            time_steps = np.arange(len(actual_values))
-            
-            # Plot actual
-            ax.plot(time_steps, actual_values, 'ko-', linewidth=2, markersize=4, label='Actual', zorder=3)
-            
-            # Plot XGBoost predictions
-            if cluster in xgb_predictions.columns:
-                xgb_pred = xgb_predictions[cluster].values[:n_test_samples]
-                ax.plot(time_steps, xgb_pred, 's--', linewidth=1.5, markersize=3, 
-                       label='XGBoost', alpha=0.8, color='#ff7f0e')
-            
-            # Plot SARIMA predictions
-            if cluster in sarima_predictions:
-                sarima_pred = sarima_predictions[cluster][:n_test_samples]
-                ax.plot(time_steps, sarima_pred, '^--', linewidth=1.5, markersize=3, 
-                       label='SARIMA', alpha=0.8, color='#1f77b4')
-            
-            # Plot LSTM predictions
-            if cluster in y_test.columns:
-                cluster_idx = list(y_test.columns).index(cluster)
-                if cluster_idx < lstm_predictions.shape[1]:
-                    lstm_pred = lstm_predictions[:n_test_samples, cluster_idx]
-                    ax.plot(time_steps, lstm_pred, 'v--', linewidth=1.5, markersize=3, 
-                           label='LSTM', alpha=0.8, color='#2ca02c')
-            
-            ax.set_title(f'{cluster} (MAE: {cluster_performance[cluster]:.2f})', 
-                        fontsize=11, fontweight='bold')
-            ax.set_xlabel('Time Step', fontsize=10)
-            ax.set_ylabel('Demand (Trips)', fontsize=10)
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc='best', fontsize=9)
-        
-        fig.suptitle('Forecast Comparison - Top 6 Clusters by Performance', 
-                    fontsize=14, fontweight='bold', y=1.00)
-        plt.tight_layout()
-        plt.savefig(os.path.join(VIZ_DIR, 'forecast_comparison.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-        logger.info("[OK] Forecast comparison plot saved")
-        
-    except Exception as e:
-        logger.warning(f"[!] Forecast comparison plot failed: {e}")
-    
+    create_individual_forecast_plots(
+        top_clusters=top_clusters,
+        y_test=y_test,
+        sarima_predictions=sarima_predictions,
+        xgb_predictions=xgb_predictions,
+        lstm_predictions=lstm_predictions,
+        output_dir='C:/Users/Anya/master_thesis/output/models_upd_30/visualizations/forecast_individual'
+    )
     # Plot 4: Residuals comparison (optional but useful)
     logger.info("Creating residuals visualization...")
     
@@ -2331,7 +2508,7 @@ if not checkpoint_mgr.is_complete('visualizations_created'):
             ax = axes[model_idx]
             residuals_all = []
             
-            for cluster in top_cluster_names:
+            for cluster in top_clusters:
                 actual_values = y_test[cluster].values[:n_test_samples]
                 
                 if model == 'XGBoost' and cluster in xgb_predictions.columns:
