@@ -5,7 +5,7 @@
   "sarima_fitted": false,
   "xgboost_fitted": false,
   "lstm_fitted": true,
-  "models_evaluated": true,
+  "models_evaluated": false,
   "feature_importance_computed": true,
   "visualizations_created": false,
   "report_generated": false,

@@ -91,7 +91,7 @@ class PipelineConfig:
     def __init__(self):
         # ========== CLUSTER CONFIGURATION ==========
         # THIS IS THE KEY PARAMETER - Change this to train on different numbers of clusters
-        self.n_top_clusters = 90
+        self.n_top_clusters = 533
 
         # ========== DATA PATHS ==========
         self.input_data_path = 'C:/Users/Anya/master_thesis/output'
