@@ -822,17 +822,19 @@ class OptimizedLSTMForecaster:
         self.model = None
         
     def preprocess(self, X_train, X_test):
-        """Reduce dimensions and scale"""
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
+        """Reduce dimensions THEN scale - correct order"""
+        # FIT on train, TRANSFORM on test
+        X_train_pca = self.pca.fit_transform(X_train)
+        X_train_scaled = self.scaler.fit_transform(X_train_pca)
         
-        X_train_reduced = self.pca.fit_transform(X_train_scaled)
-        X_test_reduced = self.pca.transform(X_test_scaled)
+        # TRANSFORM test (don't refit!)
+        X_test_pca = self.pca.transform(X_test)
+        X_test_scaled = self.scaler.transform(X_test_pca)
         
         print(f"[INFO] PCA Explained Variance: {self.pca.explained_variance_ratio_.sum():.4f}")
-        print(f"[INFO] Reduced dimensions: {X_train_reduced.shape}")
+        print(f"[INFO] Reduced dimensions: Train={X_train_scaled.shape}, Test={X_test_scaled.shape}")
         
-        return X_train_reduced, X_test_reduced
+        return X_train_scaled, X_test_scaled
 
     def build_model(self, seqlength, outputdim):
         """
@@ -1583,6 +1585,16 @@ if not checkpoint_mgr.is_complete('xgboost_fitted'):
     checkpoint_mgr.save_checkpoint('best_params_by_cluster', best_params_by_cluster)
     xgb_optimizer = XGBoostOptimizer()
 
+    def get_already_trained_xgboost_clusters(models_dir):
+        trained_clusters = []
+        if not os.path.exists(models_dir):
+            return trained_clusters
+        for filename in sorted(os.listdir(models_dir)):
+            if filename.startswith('xgb_model_') and filename.endswith('.pkl'):
+                cluster_name = filename[len('xgb_model_'):-len('.pkl')]
+                trained_clusters.append(cluster_name)
+        return trained_clusters
+
     # =========================================================================
     # STEP 4B: LOAD ALREADY TRAINED XGBoost MODELS + TRAIN REMAINING CLUSTERS
     # =========================================================================
@@ -1710,9 +1722,59 @@ if not checkpoint_mgr.is_complete('xgboost_fitted'):
                     pass
             else:
                 logger.error(f"[X] XGBoost failed for {cluster}: {payload}")
+        
+        print("\n" + "-"*80)
+        print("LOADING ALL TRAINED XGBoost MODELS INTO MEMORY FOR EVALUATION")
+        print("-"*80)
+        logger.info("Loading all trained XGBoost models from disk...")
+        logger.info(f"Current models in memory: {len(xgb_optimizer.models)}")
+        
+        all_trained_clusters = get_already_trained_xgboost_clusters(MODELS_DIR)
+        logger.info(f"Found {len(all_trained_clusters)} trained models on disk")
+        
+        models_loaded = 0
+        models_failed = 0
+        
+        for cluster_name in all_trained_clusters:
+            if str(cluster_name) in xgb_optimizer.models:
+                models_loaded += 1
+                continue
+            
+            try:
+                model_path = os.path.join(MODELS_DIR, f'xgb_model_{cluster_name}.pkl')
+                if os.path.exists(model_path):
+                    xgb_optimizer.models[str(cluster_name)] = joblib.load(model_path)
+                    models_loaded += 1
+                    if models_loaded % 100 == 0:
+                        logger.info(f"  Loaded {models_loaded}/{len(all_trained_clusters)}...")
+                        gc.collect()
+            except Exception as e:
+                logger.warning(f"Failed to load {cluster_name}: {str(e)[:50]}")
+                models_failed += 1
+        
+        gc.collect()
+        
+        logger.info(f"\n[OK] Model Loading Summary:")
+        logger.info(f"  - Successfully loaded: {models_loaded}")
+        logger.info(f"  - Failed to load: {models_failed}")
+        logger.info(f"  - Total in memory: {len(xgb_optimizer.models)}")
 
-    logger.info(f"\n[OK] Successfully trained {len(xgb_optimizer.models)}/{len(top_clusters)} "
-               f"XGBoost models (Total: {len(trained_xgb_clusters)} loaded + {len(clusters_to_train_xgb)} new)")
+
+    logger.info(f"\n{'='*80}")
+    logger.info(f"[OK] XGBoost Training & Loading Summary")
+    logger.info(f"{'='*80}")
+    logger.info(f"Total clusters to predict: {len(top_clusters)}")
+    logger.info(f"Models saved to disk: {len(all_trained_clusters)}")
+    logger.info(f"Models in memory: {len(xgb_optimizer.models)}")
+    logger.info(f"Status: {len(xgb_optimizer.models)}/{len(top_clusters)} models ready")
+    
+    if len(xgb_optimizer.models) == len(top_clusters):
+        logger.info(f"[+] SUCCESS: All {len(top_clusters)} XGBoost models loaded!")
+    else:
+        missing = len(top_clusters) - len(xgb_optimizer.models)
+        logger.warning(f"[!] WARNING: {missing} models missing")
+    
+    logger.info(f"{'='*80}\n")
     
     # =========================================================================
     # STEP 4C: COMPUTE FEATURE IMPORTANCE
@@ -1738,10 +1800,34 @@ if not checkpoint_mgr.is_complete('xgboost_fitted'):
     gc.collect()
 
 else:
-    print("\n[OK] XGBoost already fitted (from checkpoint)")
+    print("\\n[OK] XGBoost already fitted (from checkpoint)")
     xgb_optimizer = checkpoint_mgr.load_checkpoint('xgb_optimizer')
     best_params_by_cluster = checkpoint_mgr.load_checkpoint('best_params_by_cluster')
-    logger.info(f"Loaded {len(xgb_optimizer.models) if xgb_optimizer else 0} XGBoost models from checkpoint")
+    
+    # CRITICAL FIX: Load ALL 533 models from disk
+    logger.info("Loading all 533 XGBoost models from disk (checkpoint only has new ones)...")
+    
+    all_trained_clusters = get_already_trained_xgboost_clusters(MODELS_DIR)
+    logger.info(f"Found {len(all_trained_clusters)} models on disk")
+    
+    # Ensure models dict exists
+    if xgb_optimizer.models is None:
+        xgb_optimizer.models = {}
+    
+    # Load ALL models
+    models_loaded = 0
+    for cluster_name in all_trained_clusters:
+        if str(cluster_name) not in xgb_optimizer.models:
+            try:
+                model_path = os.path.join(MODELS_DIR, f'xgb_model_{cluster_name}.pkl')
+                if os.path.exists(model_path):
+                    xgb_optimizer.models[str(cluster_name)] = joblib.load(model_path)
+                    models_loaded += 1
+            except Exception as e:
+                logger.warning(f"Could not load {cluster_name}: {e}")
+    
+    logger.info(f"Loaded {len(xgb_optimizer.models)} XGBoost models from checkpoint ({models_loaded} new ones from disk)")
+    logger.info(f"Status: {len(xgb_optimizer.models)}/{len(top_clusters)} models ready")
 
 
 # =========================================================================================================
@@ -1953,15 +2039,15 @@ if not checkpoint_mgr.is_complete('pca_visualizations_created'):
         scaler = pca_scaler_data['scaler']
         
         # Get shape info
-        X_train_scaled = scaler.transform(X_train)
-        X_train_reduced = pca_model.transform(X_train_scaled)
+        X_train_pca = pca_model.transform(X_train)
+        X_train_scaled = scaler.transform(X_train_pca)
         
         from pca_visualizer import PCAVisualizer
         
         pca_viz = PCAVisualizer(
             pca_model=pca_model,
             X_original_shape=X_train.shape,
-            X_reduced_shape=X_train_reduced.shape,
+            X_reduced_shape=X_train_scaled.shape,
             explained_variance_ratio=pca_model.explained_variance_ratio_,
             output_dir=f'{OUTPUT_BASE}/visualizations/'
         )
@@ -2137,7 +2223,21 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     logger.info("="*80)
     
     # XGBoost predictions
-    xgb_predictions = xgb_optimizer.predict(X_test)
+    logger.info("Making XGBoost predictions...")
+    try:
+        xgb_predictions = xgb_optimizer.predict(X_test)
+        logger.info(f"[OK] Generated XGBoost predictions for {len(xgb_predictions.columns)} clusters")
+        logger.info(f"[OK] XGBoost predictions shape: {xgb_predictions.shape}")
+        
+        # Verify data
+        if xgb_predictions.isnull().any().any():
+            logger.warning(f"[!] XGBoost predictions contain NaN values")
+        
+        logger.info(f"[OK] XGBoost prediction range: min={xgb_predictions.min().min():.2f}, max={xgb_predictions.max().max():.2f}")
+    except Exception as e:
+        logger.error(f"[X] XGBoost prediction failed: {e}")
+        logger.error(f"[X] xgb_optimizer.models has {len(xgb_optimizer.models)} models")
+        raise
     
     # ============ SARIMA PREDICTIONS (LAZY LOADING) ============
     logger.info("Making SARIMA predictions (lazy loading from disk)...")
@@ -2263,6 +2363,10 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
             logger.info(f"[OK] LSTM predictions already aligned: {n_test} samples")
         
         logger.info(f"[OK] LSTM predictions final shape: {lstm_predictions.shape}")
+    
+        # Convert to float32 for consistency
+        lstm_predictions = lstm_predictions.astype(np.float32)
+        logger.info(f"[OK] Converted LSTM predictions to float32: {lstm_predictions.dtype}")
 
         # ===== FINAL VALIDATION CHECK (DEFENSIVE) =====
         logger.info("\nValidating LSTM predictions...")

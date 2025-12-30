@@ -2,7 +2,7 @@
 ================================================================================
 INTEGRATED FORECASTING PIPELINE - FINAL REPORT (FIXED VERSION)
 ================================================================================
-Generated: 2025-12-22 15:45:10
+Generated: 2025-12-31 00:07:01
 
 FIXES APPLIED:
 1. SHAP library import check added
@@ -23,7 +23,7 @@ MODELS EVALUATED:
 
 FEATURE ENGINEERING:
 - Lag features: 91143 total features
-- Top clusters: 90
+- Top clusters: 533
 - Training samples: 1881
 - Validation samples: 293
 - Test samples: 418
