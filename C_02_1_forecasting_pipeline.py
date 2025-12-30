@@ -26,8 +26,6 @@ import seaborn as sns
 
 # Statistical models
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.stattools import adfuller, kpss
-from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tools.sm_exceptions import ValueWarning
 from pmdarima import auto_arima
@@ -47,7 +45,6 @@ from sklearn.metrics import (
     median_absolute_error, r2_score
 )
 from xgboost import XGBRegressor
-from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import RandomizedSearchCV
 
 # Deep Learning
@@ -57,9 +54,7 @@ logging.getLogger('tensorflow').setLevel(logging.ERROR)
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import (
-    LSTM, Dense, Dropout, Bidirectional, Input, RepeatVector, TimeDistributed
-)
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import mixed_precision
@@ -218,7 +213,7 @@ logger.info("Pipeline initialization started")
 # UTILITY FUNCTIONS
 # ============================================================================
 
-# FIX #7: Helper function for MAPE calculation with zero handling
+# Helper function for MAPE calculation with zero handling
 def calculate_mape(y_true, y_pred, epsilon=1.0):
     """
     Calculate MAPE with epsilon smoothing.
@@ -241,77 +236,47 @@ def calculate_mape(y_true, y_pred, epsilon=1.0):
     # Clip to reasonable range (0-500% is acceptable)
     return np.clip(mape, 0, 500)
 
-def get_lstm_cluster_index(cluster_name, y_test_columns, lstm_predictions_shape):
+def evaluate_forecast_at_spans(y_true, y_pred, spans=[1, 3, 7], hours_per_day=24):
     """
-    Convert cluster name (string) to numeric index for LSTM predictions.
-    
-    Parameters:
-    -----------
-    cluster_name : str or int
-        The cluster identifier (e.g., 'T2_S60' or 123)
-    y_test_columns : pd.Index or list
-        Column names from y_test DataFrame
-    lstm_predictions_shape : tuple
-        Shape of lstm_predictions numpy array (n_samples, n_clusters)
-    
-    Returns:
-    --------
-    int or None
-        Numeric index for lstm_predictions array, or None if not found
+    Evaluate forecast performance at different time horizons (1-day, 3-day, 7-day).
+    Returns a dictionary of metrics for each span.
     """
-    try:
-        # Convert cluster_name to string for consistent comparison
-        cluster_str = str(cluster_name)
+    results = {}
+    
+    # Ensure inputs are numpy arrays
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    
+    max_len = len(y_true)
+    
+    for span_days in spans:
+        span_hours = span_days * hours_per_day
         
-        # Extract column list from pandas Index if needed
-        if hasattr(y_test_columns, 'tolist'):
-            cols_list = y_test_columns.tolist()
-        else:
-            cols_list = list(y_test_columns)
-        
-        # Convert all columns to strings
-        cols_str = [str(c) for c in cols_list]
-        
-        # Search for match
-        if cluster_str in cols_str:
-            return cols_str.index(cluster_str)
-        else:
-            # Fallback: try numeric conversion
-            try:
-                cluster_num = int(cluster_name)
-                if 0 <= cluster_num < lstm_predictions_shape[1]:
-                    return cluster_num
-            except (ValueError, TypeError):
-                pass
+        # We can only evaluate if we have enough data
+        if max_len >= span_hours:
+            # Slice data for this span (first N hours)
+            y_true_span = y_true[:span_hours]
+            y_pred_span = y_pred[:span_hours]
             
-            return None
+            # Calculate metrics for this specific horizon
+            rmse = np.sqrt(mean_squared_error(y_true_span, y_pred_span))
+            mae = mean_absolute_error(y_true_span, y_pred_span)
+            mape = calculate_mape(y_true_span, y_pred_span)
+            r2 = r2_score(y_true_span, y_pred_span)
             
-    except Exception as e:
-        logger.warning(f"[!] Failed to get LSTM index for {cluster_name}: {e}")
-        return None
-
-def ensure_numeric_array(arr, label="array"):
-    """
-    Ensure array is numeric (float64), not object dtype.
-    
-    Parameters:
-    -----------
-    arr : list, np.ndarray, or pd.Series
-        Input array to convert
-    label : str
-        Name for logging messages
-    
-    Returns:
-    --------
-    np.ndarray
-        Array with dtype=float64
-    """
-    if isinstance(arr, (list, np.ndarray)):
-        arr = np.asarray(arr, dtype=np.float64)
-        if arr.dtype == object:
-            logger.warning(f"[!] {label} had object dtype, converting to float64")
-            arr = arr.astype(np.float64)
-    return arr
+            results[span_days] = {
+                'rmse': rmse,
+                'mae': mae,
+                'mape': mape,
+                'r2': r2
+            }
+        else:
+            # Not enough data for this span
+            results[span_days] = {
+                'rmse': np.nan, 'mae': np.nan, 'mape': np.nan, 'r2': np.nan
+            }
+            
+    return results
 
 
 # ============================================================================
@@ -985,7 +950,6 @@ else:
     print("[OK] Data already loaded (from checkpoint)")
     data = checkpoint_mgr.load_checkpoint('raw_data')
 
-
 if not checkpoint_mgr.is_complete('data_prepared'):
     gc.collect()
     demand_matrix = prepare_demand_matrix(data, freq='H')
@@ -1006,6 +970,11 @@ else:
     val_data = checkpoint_mgr.load_checkpoint('val_data')
     test_data = checkpoint_mgr.load_checkpoint('test_data')
 
+# Select top demand clusters for modeling
+top_n_clusters = N_TOP_CLUSTERS
+print(demand_matrix.index.min(), "to", demand_matrix.index.max())
+top_clusters = demand_matrix.sum().nlargest(top_n_clusters).index.tolist()
+checkpoint_mgr.save_checkpoint('top_clusters', top_clusters)
 
 # =========================================================================
 # STEP 2 FEATURE ENGINEERING
@@ -1071,13 +1040,7 @@ else:
     feature_cols = checkpoint_mgr.load_checkpoint('feature_cols')
 
 # Check if data is time-sorted
-print(demand_matrix.index.min(), "to", demand_matrix.index.max())
 print("Is sorted:", demand_matrix.index.is_monotonic_increasing)
-
-# Select top demand clusters for modeling
-top_n_clusters = N_TOP_CLUSTERS
-top_clusters = demand_matrix.sum().nlargest(top_n_clusters).index.tolist()
-checkpoint_mgr.save_checkpoint('top_clusters', top_clusters)
 
 # ============================================================================
 # HELPER: GET ALREADY TRAINED SARIMA CLUSTERS
@@ -1422,17 +1385,14 @@ if not checkpoint_mgr.is_complete('sarima_fitted'):
 
 else:
     print("[OK] SARIMA models already fitted from checkpoint")
-    sarima_models = checkpoint_mgr.load_checkpoint('sarima_models')
-    # Lazy load fitted_sarima only if needed
-    if os.path.exists(MODELS_DIR):
-        trained_clusters = get_already_trained_clusters(MODELS_DIR)
-        fitted_sarima = {}
-        logger.info("Lazy-loading SARIMA models from disk...")
-        for c in trained_clusters:
-            try:
-                fitted_sarima[str(c)] = joblib.load(os.path.join(MODELS_DIR, f'sarima_model_{c}.pkl'))
-            except: 
-                pass
+    # 1. Find trained models (only scan filenames, don't load)
+    trained_sarima_clusters = get_already_trained_clusters(MODELS_DIR)
+    logger.info(f"Found {len(trained_sarima_clusters)} already trained SARIMA clusters: {sorted(list(trained_sarima_clusters))[:5]}...")
+    
+    # 2. NO LOADING into fitted_sarima dictionary
+    fitted_sarima = {}  # Empty! Models loaded on-demand during prediction
+
+gc.collect()
 
 # ============================================================================
 # HELPER: PARALLEL XGBOOST TASK
@@ -1693,35 +1653,42 @@ if not checkpoint_mgr.is_complete('xgboost_fitted'):
     xgb_optimizer.best_params = best_params_by_cluster
     
     # Load already trained models from disk into memory
-    for cluster in trained_xgb_clusters:
-        try:
-            model_path = os.path.join(MODELS_DIR, f'xgb_model_{cluster}.pkl')
-            if os.path.exists(model_path):
-                model = joblib.load(model_path)
-                xgb_optimizer.models[str(cluster)] = model
-        except Exception as e:
-            logger.warning(f"Could not reload XGBoost model {cluster}: {e}")
+    # for cluster in trained_xgb_clusters:
+    #     try:
+    #         model_path = os.path.join(MODELS_DIR, f'xgb_model_{cluster}.pkl')
+    #         if os.path.exists(model_path):
+    #             model = joblib.load(model_path)
+    #             xgb_optimizer.models[str(cluster)] = model
+    #     except Exception as e:
+    #         logger.warning(f"Could not reload XGBoost model {cluster}: {e}")
     
-    logger.info(f"Loaded {len(xgb_optimizer.models)} previously trained XGBoost models from disk")
+    # logger.info(f"Loaded {len(xgb_optimizer.models)} previously trained XGBoost models from disk")
     
     # Train remaining clusters in PARALLEL
+    logger.info("Converting data to shared float32 numpy arrays for parallel workers...")
+    X_train_np = X_train.astype(np.float32).values
+    X_val_np = X_val.astype(np.float32).values if X_val is not None else None
+
     if clusters_to_train_xgb:
         logger.info(f"Starting parallel XGBoost training for {len(clusters_to_train_xgb)} clusters...")
         logger.info("Configuration: 4 parallel workers x 4 threads each = 16 threads total")
+
+        # Pre-convert targets to a dictionary of numpy arrays to avoid repeated DataFrame slicing
+        y_train_dict = {c: y_train[c].astype(np.float32).values for c in clusters_to_train_xgb}
+        y_val_dict = {c: y_val[c].astype(np.float32).values for c in clusters_to_train_xgb} if y_val is not None else {}
         
         # Prepare arguments for parallel execution
         parallel_args = []
         for cluster in clusters_to_train_xgb:
-            # At this point, EVERY cluster should have params in best_params_by_cluster
             # thanks to the assignment logic above.
             p = best_params_by_cluster.get(cluster, derived_default_params)
             
             parallel_args.append((
                 cluster, 
-                X_train.values, 
-                y_train[cluster].values, 
-                X_val.values if X_val is not None else None, 
-                y_val[cluster].values if y_val is not None else None,
+                X_train_np, 
+                y_train_dict[cluster], 
+                X_val_np, 
+                y_val_dict.get(cluster),
                 p,
                 MODELS_DIR
             ))
@@ -1819,7 +1786,7 @@ if not checkpoint_mgr.is_complete('lstm_fitted'):
     X_train_reduced, X_test_reduced = lstm_forecaster.preprocess(X_train, X_test)
     
     # Reshape for LSTM sequences (seq_length=24)
-    seq_length = 168
+    seq_length = config.seq_length
     n_features_reduced = X_train_reduced.shape[1]
     
     def create_sequences(X_data, y_data, seq_len):
@@ -1903,7 +1870,7 @@ if lstm_forecaster is None or lstm_forecaster.model is None:
     logger.info("Refitting LSTM from scratch...")
     X_train_reduced, X_test_reduced = lstm_forecaster.preprocess(X_train, X_test)
     
-    seq_length = 168
+    seq_length = config.seq_length
     n_features_reduced = X_train_reduced.shape[1]
     
     n_train_samples = (len(X_train_reduced) // seq_length) * seq_length
@@ -2009,6 +1976,150 @@ if not checkpoint_mgr.is_complete('pca_visualizations_created'):
 else:
     logger.info("[OK] PCA visualizations already created")
 
+# ============================================================================
+# WORKER FUNCTION FOR PARALLEL METRICS CALCULATION
+# ============================================================================
+
+def calculate_metrics_for_single_cluster(
+    cluster_idx,
+    cluster,
+    ytest,
+    sarima_predictions,
+    xgb_predictions,
+    lstm_predictions,
+    n_test_samples,
+    common_clusters
+):
+    """Calculate metrics for a single cluster (worker function for parallelization)."""
+    import numpy as np
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, median_absolute_error
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    cluster_metrics = {"SARIMA": {}, "XGBoost": {}, "LSTM": {}}
+    
+    try:
+        if hasattr(ytest, 'columns'):
+            if cluster not in ytest.columns:
+                return cluster, cluster_metrics
+            actual_full = ytest[cluster].values
+        else:
+            return cluster, cluster_metrics
+        
+        actual = actual_full[:n_test_samples]
+        
+        # ============================================
+        # SARIMA METRICS
+        # ============================================
+        try:
+            if isinstance(sarima_predictions, dict):
+                sarima_pred = sarima_predictions.get(cluster, None)
+            else:
+                sarima_pred = sarima_predictions[cluster].values if cluster in sarima_predictions.columns else None
+            
+            if sarima_pred is not None:
+                sarima_pred = sarima_pred[:n_test_samples]
+                if len(sarima_pred) == len(actual):
+                    valid_idx = ~(np.isnan(sarima_pred) | np.isinf(sarima_pred) | np.isnan(actual) | np.isinf(actual))
+                    if valid_idx.sum() > 0:
+                        y_actual_valid = actual[valid_idx]
+                        y_pred_valid = sarima_pred[valid_idx]
+                        
+                        cluster_metrics["SARIMA"] = {
+                            "RMSE": np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)),
+                            "MAE": mean_absolute_error(y_actual_valid, y_pred_valid),
+                            "MAPE": calculate_mape(y_actual_valid, y_pred_valid),
+                            "R2": r2_score(y_actual_valid, y_pred_valid),
+                            "MedianAE": median_absolute_error(y_actual_valid, y_pred_valid)
+                        }
+                        
+                        span_metrics = evaluate_forecast_at_spans(y_actual_valid, y_pred_valid, spans=[1, 3, 7])
+                        for span_days, metrics_dict in span_metrics.items():
+                            for metric_name, metric_value in metrics_dict.items():
+                                cluster_metrics["SARIMA"][f'{span_days}d_{metric_name}'] = metric_value
+        except Exception as e:
+            logger.warning(f"[!] SARIMA metrics failed for cluster {cluster}: {e}")
+        
+        # ============================================
+        # XGBoost METRICS
+        # ============================================
+        try:
+            if isinstance(xgb_predictions, dict):
+                xgb_pred = xgb_predictions.get(cluster, None)
+            else:
+                xgb_pred = xgb_predictions[cluster].values if cluster in xgb_predictions.columns else None
+            
+            if xgb_pred is not None:
+                xgb_pred = xgb_pred[:n_test_samples]
+                if len(xgb_pred) == len(actual):
+                    valid_idx = ~(np.isnan(xgb_pred) | np.isinf(xgb_pred) | np.isnan(actual) | np.isinf(actual))
+                    if valid_idx.sum() > 0:
+                        y_actual_valid = actual[valid_idx]
+                        y_pred_valid = xgb_pred[valid_idx]
+                        
+                        cluster_metrics["XGBoost"] = {
+                            "RMSE": np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)),
+                            "MAE": mean_absolute_error(y_actual_valid, y_pred_valid),
+                            "MAPE": calculate_mape(y_actual_valid, y_pred_valid),
+                            "R2": r2_score(y_actual_valid, y_pred_valid),
+                            "MedianAE": median_absolute_error(y_actual_valid, y_pred_valid)
+                        }
+                        
+                        span_metrics = evaluate_forecast_at_spans(y_actual_valid, y_pred_valid, spans=[1, 3, 7])
+                        for span_days, metrics_dict in span_metrics.items():
+                            for metric_name, metric_value in metrics_dict.items():
+                                cluster_metrics["XGBoost"][f'{span_days}d_{metric_name}'] = metric_value
+        except Exception as e:
+            logger.warning(f"[!] XGBoost metrics failed for cluster {cluster}: {e}")
+        
+        # ============================================
+        # LSTM METRICS
+        # ============================================
+        try:
+            if isinstance(lstm_predictions, dict):
+                lstm_pred = lstm_predictions.get(cluster, None)
+            elif isinstance(lstm_predictions, np.ndarray):
+                try:
+                    cluster_idx_lstm = list(ytest.columns).index(cluster)
+                    lstm_pred = lstm_predictions[:n_test_samples, cluster_idx_lstm]
+                except:
+                    lstm_pred = None
+            else:
+                lstm_pred = None
+            
+            if lstm_pred is not None:
+                lstm_pred = lstm_pred[:n_test_samples]
+                if len(lstm_pred) == len(actual):
+                    valid_idx = ~(np.isnan(lstm_pred) | np.isinf(lstm_pred) | np.isnan(actual) | np.isinf(actual))
+                    if valid_idx.sum() > 0:
+                        y_actual_valid = actual[valid_idx]
+                        y_pred_valid = lstm_pred[valid_idx]
+                        
+                        cluster_metrics["LSTM"] = {
+                            "RMSE": np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)),
+                            "MAE": mean_absolute_error(y_actual_valid, y_pred_valid),
+                            "MAPE": calculate_mape(y_actual_valid, y_pred_valid),
+                            "R2": r2_score(y_actual_valid, y_pred_valid),
+                            "MedianAE": median_absolute_error(y_actual_valid, y_pred_valid)
+                        }
+                        
+                        span_metrics = evaluate_forecast_at_spans(y_actual_valid, y_pred_valid, spans=[1, 3, 7])
+                        for span_days, metrics_dict in span_metrics.items():
+                            for metric_name, metric_value in metrics_dict.items():
+                                cluster_metrics["LSTM"][f'{span_days}d_{metric_name}'] = metric_value
+        except Exception as e:
+            logger.warning(f"[!] LSTM metrics failed for cluster {cluster}: {e}")
+        
+        return cluster, cluster_metrics
+        
+    except Exception as e:
+        logger.error(f"[X] Fatal error calculating metrics for {cluster}: {e}")
+        return cluster, cluster_metrics
+
+# ============================================================================
+# END WORKER FUNCTION
+# ============================================================================
+
 
 # =========================================================================
 # STEP 6: MODEL EVALUATION (ENHANCED METRICS)
@@ -2028,31 +2139,55 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     # XGBoost predictions
     xgb_predictions = xgb_optimizer.predict(X_test)
     
-    # ============ SARIMA PREDICTIONS ============
-    logger.info("Making SARIMA predictions (using pre-fitted models)...")
+    # ============ SARIMA PREDICTIONS (LAZY LOADING) ============
+    logger.info("Making SARIMA predictions (lazy loading from disk)...")
     logger.info(f"Note: Using multi-step forecast without refitting")
     
     sarima_predictions = {}
     
-    if not isinstance(fitted_sarima, dict):
-        logger.error("[!] fitted_sarima is not a dictionary")
-        fitted_sarima = {}
+    # Identify available models
+    available_sarima_clusters = get_already_trained_clusters(MODELS_DIR)
     
-    logger.info(f"Processing {len(fitted_sarima)} SARIMA models...")
+    # OPTIMIZATION: Only predict for clusters present in TEST data
+    clusters_to_predict = list(set(available_sarima_clusters) & set(y_test.columns))
     
-    for cluster_idx, (cluster_name, sarima_results) in enumerate(fitted_sarima.items()):
+    logger.info(f"Found {len(available_sarima_clusters)} trained models. Predicting for {len(clusters_to_predict)} test clusters...")
+    
+    for cluster_idx, cluster_name in enumerate(clusters_to_predict):
         try:
-            forecast_result = sarima_results.get_forecast(steps=len(test_data))
+            model_path = os.path.join(MODELS_DIR, f'sarima_model_{cluster_name}.pkl')
+            
+            if not os.path.exists(model_path):
+                continue
+                
+            # 1. Load model
+            sarima_results = joblib.load(model_path)
+            
+            # 2. Forecast
+            # Ensure we don't predict more steps than we have test data for
+            steps = len(test_data)
+            forecast_result = sarima_results.get_forecast(steps=steps)
             preds = forecast_result.predicted_mean.values
+            
+            # 3. Store result
             sarima_predictions[cluster_name] = preds
             
-            if (cluster_idx + 1) % 50 == 0:
-                logger.info(f"  [{cluster_idx + 1}/{len(fitted_sarima)}] SARIMA forecasts completed")
+            # 4. CRITICAL: Clear memory
+            del sarima_results
+            del forecast_result
             
+            # periodic GC
+            if (cluster_idx + 1) % 50 == 0:
+                gc.collect()
+                logger.info(f"  [{cluster_idx + 1}/{len(clusters_to_predict)}] SARIMA forecasts completed")
+                
         except Exception as e:
-            logger.warning(f"[!] SARIMA forecast failed for {cluster_name}: {type(e).__name__}")
+            logger.warning(f"[!] SARIMA forecast failed for {cluster_name}: {e}")
+            # Fill with NaNs so metrics calculation handles it gracefully
             sarima_predictions[cluster_name] = np.full(len(test_data), np.nan)
-    
+            
+    # Final cleanup
+    gc.collect()
     logger.info(f"[OK] SARIMA predictions completed for {len(sarima_predictions)} clusters")
     
     # ============ LSTM PREDICTIONS ============
@@ -2072,7 +2207,7 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
         _, X_test_reduced = lstm_forecaster_temp.preprocess(X_train, X_test)
         
         # Create sequences
-        seq_length = 24
+        seq_length = config.seq_length
         def create_sequences_local(X_data, seq_len):
             X_seq = []
             for i in range(len(X_data) - seq_len):
@@ -2084,33 +2219,113 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
         # Load model
         model_path = os.path.join(MODELS_DIR, 'lstm_model_final.h5')
         if os.path.exists(model_path):
-            lstm_forecaster_temp.model = keras.models.load_model(
-                model_path,
-                custom_objects={'weighted_mse_loss': weighted_mse_loss}
-            )
-            lstm_pred_raw = lstm_forecaster_temp.model.predict(X_test_lstm)
-            lstm_predictions_original = np.maximum(lstm_pred_raw, 0)
-            
-            # PAD LSTM predictions to match test set length
-            # LSTM produces len(X_test) - seq_length predictions
-            # Pad with last predictions to match test set size
-            n_lstm_preds = lstm_predictions_original.shape[0]
-            n_test = len(X_test)
-            
-            if n_lstm_preds < n_test:
-                # Pad with last value
-                padding_needed = n_test - n_lstm_preds
-                last_pred = lstm_predictions_original[-1:, :]
-                padding = np.repeat(last_pred, padding_needed, axis=0)
-                lstm_predictions = np.vstack([lstm_predictions_original, padding])
-                logger.info(f"[OK] LSTM predictions padded from {n_lstm_preds} to {n_test} samples")
-            else:
-                lstm_predictions = lstm_predictions_original[:n_test, :]
-            
-            logger.info(f"[OK] LSTM predictions shape: {lstm_predictions.shape}")
+            try:
+                lstm_forecaster_temp.model = keras.models.load_model(
+                    model_path,
+                    custom_objects={'weighted_mse_loss': weighted_mse_loss}
+                )
+                lstm_pred_raw = lstm_forecaster_temp.model.predict(X_test_lstm)
+            except Exception as e:
+                logger.error(f"[X] Failed to load/predict with LSTM model: {e}")
+                lstm_pred_raw = np.full((len(X_test_lstm), len(y_test.columns)), np.nan)
         else:
-            logger.warning(f"[!] LSTM model file not found: {model_path}")
+            logger.error(f"[X] LSTM model file not found: {model_path}")
+            lstm_pred_raw = np.full((len(X_test_lstm), len(y_test.columns)), np.nan)
+        
+        # ===== COMMON POST-PROCESSING PATH (ALWAYS RUNS) =====
+        # This applies whether model loaded successfully, failed, or was not found
+        logger.info("Applying post-processing (non-negativity + alignment)...")
+        
+        # Enforce non-negativity
+        lstm_predictions_original = np.maximum(lstm_pred_raw, 0)
+        logger.info(f"[OK] Non-negative constraint applied. Shape: {lstm_predictions_original.shape}")
+        
+        # PAD/TRIM LSTM predictions to match test set length
+        n_lstm_preds = lstm_predictions_original.shape[0]
+        n_test = len(X_test)
+        
+        logger.info(f"[INFO] LSTM prediction alignment: {n_lstm_preds} predictions vs {n_test} test samples")
+        
+        if n_lstm_preds < n_test:
+            # Pad with last value (simple forward-fill extrapolation)
+            padding_needed = n_test - n_lstm_preds
+            last_pred = lstm_predictions_original[-1:, :]
+            padding = np.repeat(last_pred, padding_needed, axis=0)
+            lstm_predictions = np.vstack([lstm_predictions_original, padding])
+            logger.info(f"[OK] LSTM predictions padded: {n_lstm_preds} -> {n_test} samples")
+        elif n_lstm_preds > n_test:
+            # Trim to match test length
+            lstm_predictions = lstm_predictions_original[:n_test, :]
+            logger.warning(f"[!] LSTM predictions trimmed: {n_lstm_preds} -> {n_test} samples")
+        else:
+            # Perfect alignment
+            lstm_predictions = lstm_predictions_original
+            logger.info(f"[OK] LSTM predictions already aligned: {n_test} samples")
+        
+        logger.info(f"[OK] LSTM predictions final shape: {lstm_predictions.shape}")
+
+        # ===== FINAL VALIDATION CHECK (DEFENSIVE) =====
+        logger.info("\nValidating LSTM predictions...")
+        
+        if lstm_predictions is None:
+            logger.error("[CRITICAL] lstm_predictions is still None! This should not happen.")
+            logger.warning("[FALLBACK] Creating zero array...")
             lstm_predictions = np.zeros((len(X_test), len(y_test.columns)))
+        
+        if lstm_predictions.shape[0] != len(X_test):
+            logger.error(f"[CRITICAL] Shape mismatch: lstm_predictions={lstm_predictions.shape[0]}, X_test={len(X_test)}")
+            logger.warning("[FALLBACK] Force-aligning shapes...")
+            
+            if lstm_predictions.shape[0] < len(X_test):
+                # Pad with zeros
+                padding = np.zeros((len(X_test) - lstm_predictions.shape[0], lstm_predictions.shape[1]))
+                lstm_predictions = np.vstack([lstm_predictions, padding])
+                logger.warning(f"[!] Padded LSTM predictions to {lstm_predictions.shape}")
+            else:
+                # Trim
+                lstm_predictions = lstm_predictions[:len(X_test), :]
+                logger.warning(f"[!] Trimmed LSTM predictions to {lstm_predictions.shape}")
+        
+        assert lstm_predictions.shape[0] == len(X_test), \
+            f"LSTM shape alignment failed: {lstm_predictions.shape[0]} vs {len(X_test)}"
+        
+        logger.info(f"[OK] LSTM predictions validation PASSED")
+        logger.info(f"    Shape: {lstm_predictions.shape}")
+        logger.info(f"    Dtype: {lstm_predictions.dtype}")
+        logger.info(f"    Min/Max: {np.nanmin(lstm_predictions):.2f} / {np.nanmax(lstm_predictions):.2f}")
+        logger.info(f"    NaN count: {np.isnan(lstm_predictions).sum()}")
+
+        # ===== POST-FIX VALIDATION TEST =====
+        print("\n" + "="*60)
+        print("LSTM PREDICTIONS VALIDATION")
+        print("="*60)
+
+        # Test 1: Defined
+        assert lstm_predictions is not None, "lstm_predictions is None"
+        print("[OK] lstm_predictions is defined")
+
+        # Test 2: Shape
+        assert lstm_predictions.shape[0] == len(X_test), \
+            f"Shape mismatch: {lstm_predictions.shape[0]} vs {len(X_test)}"
+        print(f"[OK] Shape matches: {lstm_predictions.shape}")
+
+        # Test 3: Dtype
+        assert lstm_predictions.dtype in [np.float32, np.float64], "Wrong dtype"
+        print(f"[OK] Data type: {lstm_predictions.dtype}")
+
+        # Test 4: Values
+        assert np.nanmin(lstm_predictions) >= 0, "Has negative values"
+        print(f"[OK] Non-negative (min={np.nanmin(lstm_predictions):.4f})")
+
+        # Test 5: Consistency
+        assert lstm_predictions.shape == xgb_predictions.shape, \
+            "Shape mismatch with XGBoost"
+        print(f"[OK] Consistent with XGBoost predictions shape")
+
+        print("="*60)
+        print("ALL CHECKS PASSED [OK]")
+        print("="*60 + "\n")
+
     else:
         logger.warning("[!] PCA/scaler not found")
         lstm_predictions = np.zeros((len(X_test), len(y_test.columns)))
@@ -2122,88 +2337,30 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     logger.info(f"Evaluating {len(common_clusters)} common clusters (SARIMA + XGBoost + LSTM)")
     
     metrics_results = {}
-    
-    for cluster_idx, cluster in enumerate(common_clusters):
-        actual_full = y_test[cluster].values
-        actual = actual_full[:n_test_samples]
-        
-        metrics_results[cluster] = {
-            'SARIMA': {},
-            'XGBoost': {},
-            'LSTM': {}
-        }
-        
-        # ===== XGBoost METRICS =====
-        try:
-            xgb_pred = xgb_predictions[cluster].values[:len(actual)]
-            valid_idx = ~(np.isnan(xgb_pred) | np.isinf(xgb_pred) | np.isnan(actual) | np.isinf(actual))
-            
-            if valid_idx.sum() > 0:
-                y_actual_valid = actual[valid_idx]
-                y_pred_valid = xgb_pred[valid_idx]
-                
-                metrics_results[cluster]['XGBoost'] = {
-                    'RMSE': np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)),
-                    'MAE': mean_absolute_error(y_actual_valid, y_pred_valid),
-                    'MAPE': calculate_mape(y_actual_valid, y_pred_valid),  # ← Use function with epsilon
-                    'R2': r2_score(y_actual_valid, y_pred_valid),
-                    'Median_AE': median_absolute_error(y_actual_valid, y_pred_valid),
-                    'RMSE_norm': np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)) / (y_actual_valid.mean() + 1e-10)
-                }
-        except Exception as e:
-            logger.warning(f"[!] XGBoost metrics failed for {cluster}: {e}")
-                
-        # ===== SARIMA METRICS =====
-        try:
-            if cluster in sarima_predictions:
-                sarima_pred = sarima_predictions[cluster][:len(actual)]
-                valid_idx = ~(np.isnan(sarima_pred) | np.isinf(sarima_pred) | np.isnan(actual) | np.isinf(actual))
-                
-                if valid_idx.sum() > 0:
-                    y_actual_valid = actual[valid_idx]
-                    y_pred_valid = sarima_pred[valid_idx]
-                    
-                    metrics_results[cluster]['SARIMA'] = {
-                        'RMSE': np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)),
-                        'MAE': mean_absolute_error(y_actual_valid, y_pred_valid),
-                        'MAPE': calculate_mape(y_actual_valid, y_pred_valid),
-                        'R2': r2_score(y_actual_valid, y_pred_valid),
-                        'Median_AE': median_absolute_error(y_actual_valid, y_pred_valid),
-                        'RMSE_norm': np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)) / (y_actual_valid.mean() + 1e-10)
-                    }
-        except Exception as e:
-            logger.warning(f"[!] SARIMA metrics failed for {cluster}: {e}")
-        
-        # ===== LSTM METRICS =====
-        try:
-            # Find cluster index by name
-            cluster_list = list(y_test.columns)
-            if cluster in cluster_list:
-                cluster_idx = cluster_list.index(cluster)
-                
-                # Use padded LSTM predictions (same length as test set)
-                lstm_pred_cluster = lstm_predictions[:len(actual), cluster_idx]
-                valid_idx = ~(np.isnan(lstm_pred_cluster) | np.isinf(lstm_pred_cluster) | 
-                            np.isnan(actual) | np.isinf(actual))
-                
-                if valid_idx.sum() > 0:
-                    y_actual_valid = actual[valid_idx]
-                    y_pred_valid = lstm_pred_cluster[valid_idx]
-                    
-                    metrics_results[cluster]['LSTM'] = {
-                        'RMSE': np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)),
-                        'MAE': mean_absolute_error(y_actual_valid, y_pred_valid),
-                        'MAPE': calculate_mape(y_actual_valid, y_pred_valid),
-                        'R2': r2_score(y_actual_valid, y_pred_valid),
-                        'Median_AE': median_absolute_error(y_actual_valid, y_pred_valid),
-                        'RMSE_norm': np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)) / (y_actual_valid.mean() + 1e-10)
-                    }
-        except Exception as e:
-            logger.warning(f"[!] LSTM metrics failed for {cluster}: {e}")
-                
-        if (cluster_idx + 1) % 50 == 0:
-            logger.info(f"  [{cluster_idx + 1}/{len(common_clusters)}] Metrics calculated")
-    
+
+    logger.info(f"[INFO] Starting parallel metrics calculation with 8 workers...")
+    logger.info(f"[INFO] Processing {len(common_clusters)} clusters in parallel")
+
+    cluster_metrics_list = Parallel(n_jobs=8, backend='loky', verbose=10)(
+        delayed(calculate_metrics_for_single_cluster)(
+            idx,
+            cluster,
+            y_test,
+            sarima_predictions,
+            xgb_predictions,
+            lstm_predictions,
+            n_test_samples,
+            common_clusters
+        )
+        for idx, cluster in enumerate(common_clusters)
+    )
+
+    for cluster, cluster_metrics in cluster_metrics_list:
+        metrics_results[cluster] = cluster_metrics
+
+    logger.info(f"[OK] Parallel metrics calculation completed!")
+    logger.info(f"[OK] Calculated metrics for {len(metrics_results)} clusters")
+
     # Save checkpoints
     checkpoint_mgr.save_checkpoint('metrics_results', metrics_results)
     checkpoint_mgr.save_checkpoint('xgb_predictions', xgb_predictions)
@@ -2231,6 +2388,67 @@ else:
 print("\n" + "="*80)
 print("STEP 7: VISUALIZATIONS")
 print("="*80)
+
+def plot_forecasting_degradation(metrics_results, output_dir):
+    """
+    Visualize how forecast accuracy degrades over time (1-day vs 3-day vs 7-day).
+    """
+    logger.info("Creating forecasting degradation analysis...")
+    
+    # Aggregating data
+    models = ['SARIMA', 'XGBoost', 'LSTM']
+    spans = [1, 3, 7]
+    metrics = ['RMSE', 'MAE', 'MAPE']
+    
+    degradation_data = {m: {model: [] for model in models} for m in metrics}
+    
+    # Calculate averages across all clusters
+    for model in models:
+        for span in spans:
+            for metric in metrics:
+                key = f'{span}d_{metric}'
+                # Extract values from all clusters
+                values = [
+                    metrics_results[c].get(model, {}).get(key, np.nan) 
+                    for c in metrics_results.keys()
+                ]
+                # Store mean
+                degradation_data[metric][model].append(np.nanmean(values))
+
+    # Create Plot
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    for idx, metric in enumerate(metrics):
+        ax = axes[idx]
+        x = np.arange(len(spans))
+        width = 0.25
+        
+        # Plot bars for each model
+        for i, model in enumerate(models):
+            offset = (i - 1) * width
+            values = degradation_data[metric][model]
+            ax.bar(x + offset, values, width, label=model, alpha=0.8)
+            
+            # Add trend lines
+            ax.plot(x + offset, values, marker='o', linestyle='-', linewidth=1, alpha=0.5)
+
+        ax.set_title(f'{metric} Degradation over Time', fontsize=12, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels([f'{s}-Day' for s in spans])
+        ax.set_xlabel('Forecast Horizon')
+        ax.set_ylabel(f'Average {metric}')
+        ax.grid(True, alpha=0.3)
+        if idx == 0:
+            ax.legend()
+            
+    plt.suptitle('Model Performance Degradation: Short vs Long Term', fontsize=16, y=1.05)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'forecasting_degradation.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info("[OK] Degradation plot saved")
+
+# === CALL THE FUNCTION ===
+plot_forecasting_degradation(metrics_results, VIZ_DIR)
 
 def create_individual_forecast_plots(
     top_clusters,

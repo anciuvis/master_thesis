@@ -2,7 +2,7 @@
   "data_loaded": true,
   "data_prepared": true,
   "features_engineered": true,
-  "sarima_fitted": false,
+  "sarima_fitted": true,
   "xgboost_fitted": false,
   "lstm_fitted": true,
   "models_evaluated": false,
