@@ -18,6 +18,8 @@ import joblib
 from datetime import datetime
 from typing import Dict, Tuple, Optional
 from itertools import product
+from collections import Counter
+import re
 
 import numpy as np
 import pandas as pd
@@ -25,10 +27,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Statistical models
-from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tools.sm_exceptions import ValueWarning
-from pmdarima import auto_arima
+from sarima_predictor import SARIMAPredictor
+from statsmodels.tsa.stattools import adfuller
 
 # Multiprocessing
 from joblib import Parallel, delayed
@@ -40,10 +42,7 @@ import multiprocessing as mp
 # Machine Learning
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.metrics import (
-    mean_squared_error, mean_absolute_error, mean_absolute_percentage_error,
-    median_absolute_error, r2_score
-)
+from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error, r2_score, median_absolute_error
 from xgboost import XGBRegressor
 from sklearn.model_selection import RandomizedSearchCV
 
@@ -93,7 +92,7 @@ class PipelineConfig:
         self.input_file = 'taxi_data_cleaned_full_with_clusters.parquet'
         
         # ========== OUTPUT PATHS (dynamic based on n_top_clusters) ==========
-        self.output_base = f'C:/Users/Anya/master_thesis/output/models_upd_30'
+        self.output_base = 'C:/Users/Anya/master_thesis/output/models_upd_30'
         self.checkpoint_dir = os.path.join(self.output_base, 'checkpoints')
         self.results_dir = os.path.join(self.output_base, 'results')
         self.viz_dir = os.path.join(self.output_base, 'visualizations')
@@ -120,23 +119,18 @@ class PipelineConfig:
         }
 
         # ========== LSTM ARCHITECTURE ==========
-        self.lstm_n_components = 256  # PCA reduction dimension
+        self.lstm_n_components = 256
         self.lstm_units = 512
         self.lstm_epochs = 200
         self.lstm_batch_size = 16
-        self.lstm_layers = 3    # Add 3rd LSTM layer
-        self.dropout = 0.3      # Stronger regularization
+        self.lstm_layers = 3
+        self.dropout = 0.3
 
         # ========== SARIMA PARAMETERS ==========
-        # self.sarima_order = (0, 1, 1)  # Differencing + MA, no AR
-        self.sarima_order = (0, 1, 0)
-        self.sarima_seasonal_order = (0, 1, 0, 168)
-        # self.sarima_seasonal_order = (1, 1, 0, 168) # Keep seasonal AR for day-of-week, minimal D
-        # self.sarima_maxiter = 100
-        self.sarima_maxiter = 50  # Reduced iterations
+        self.sarima_order = (0, 0, 1)
+        self.sarima_seasonal_order = (0, 0, 1, 168)
+        self.sarima_maxiter = 50
         self.use_pmdarima = True
-
-
 
         # Create output directories
         for d in [self.checkpoint_dir, self.results_dir, self.viz_dir, self.log_dir, self.models_dir]:
@@ -472,82 +466,6 @@ def create_train_val_test_split(demand_matrix: pd.DataFrame,
 
 
 # ============================================================================
-# SARIMA MODEL - MEMORY OPTIMIZED VERSION
-# ============================================================================
-
-class SARIMAPredictor:
-    """SARIMA wrapper with memory-efficient fallback strategies"""
-
-    def __init__(self, cluster_name: str):
-        self.cluster_name = cluster_name
-        self.model = None
-        self.results = None
-        self.fitted = False
-        self.train_data = None
-        self.strategy = None
-
-    def fit(self, train_data: pd.Series, order=SARIMA_ORDER, seasonal_order=SARIMA_SEASON_ORDER, maxiter=SARIMA_MAXITER):
-        """
-        Fit SARIMA with memory-efficient strategies optimized for weekly seasonality.
-        """        
-        try:
-            gc.collect()
-
-            self.model = SARIMAX(
-                train_data,
-                order=order,
-                seasonal_order=seasonal_order,
-                enforce_stationarity=False,
-                enforce_invertibility=False,
-                disp=False,
-                measurement_error=True,  # Reduces numerical issues
-                error_cov_type='diagonal'  # Simpler covariance structure
-            )
-            
-            self.results = self.model.fit(
-                disp=False,
-                maxiter=maxiter,
-                low_memory=True,
-                method='lbfgs',  # Explicitly set (default)
-                start_params=None,
-                transform_params=True
-            )
-            
-            self.fitted = True
-            logger.info(f"[OK] SARIMA fitted, AIC={self.results.aic:.2f}")
-            return self.results
-            
-        except MemoryError as e:
-            logger.warning(f"[FALLBACK] failed - MemoryError: {str(e)[:100]}")
-            gc.collect()
-
-            
-        except Exception as e:
-            logger.warning(f"[FALLBACK] failed - {type(e).__name__}: {str(e)[:80]}")
-            gc.collect()
-
-        
-    
-    def forecast(self, steps: int):
-        """Generate forecasts"""
-        if not self.fitted:
-            raise ValueError("Model not fitted")
-        forecast = self.results.get_forecast(steps=steps)
-        return forecast.predicted_mean.values
-    
-    def get_forecast_with_ci(self, steps: int, alpha: float = 0.05):
-        """Forecasts with confidence intervals"""
-        if not self.fitted:
-            raise ValueError("Model not fitted")
-        forecast = self.results.get_forecast(steps=steps)
-        forecast_ci = forecast.conf_int(alpha=alpha)
-        return {
-            'forecast': forecast.predicted_mean.values,
-            'lower_ci': forecast_ci.iloc[:, 0].values,
-            'upper_ci': forecast_ci.iloc[:, 1].values
-        }
-
-# ============================================================================
 # XGBOOST WITH HYPERPARAMETER OPTIMIZATION
 # ============================================================================
 
@@ -617,7 +535,6 @@ class XGBoostOptimizer:
         param_grid = self.get_param_grid(grid_type)
         tscv = TimeSeriesSplit(n_splits=3)
         
-        from sklearn.model_selection import RandomizedSearchCV
         
         grid_search = RandomizedSearchCV(
             estimator=base_model,
@@ -812,7 +729,6 @@ def weighted_mse_loss(y_true, y_pred):
 # ============================================================================
 # LSTM
 # ============================================================================
-
 class OptimizedLSTMForecaster:
     def __init__(self, n_components=256, lstm_units=256):
         self.n_components = n_components
@@ -840,13 +756,13 @@ class OptimizedLSTMForecaster:
         """
         Build Many-to-One LSTM with INCREASED capacity.
         
-        Input: (batch_size, seq_length=24, n_components=256)
+        Input: (batch_size, seq_length=168, n_components=256)
         Output: (batch_size, n_clusters=533)
         """
         model = keras.Sequential([
             # First LSTM layer with increased units (default 256)
             keras.layers.LSTM(
-                self.lstm_units,  # ← INCREASED from 128 to 256
+                self.lstm_units,  
                 return_sequences=True,
                 input_shape=(seqlength, self.n_components),
                 dropout=0.2
@@ -854,7 +770,7 @@ class OptimizedLSTMForecaster:
             
             # Second LSTM layer
             keras.layers.LSTM(
-                self.lstm_units // 2,  # 128 if lstm_units=256
+                self.lstm_units // 2, 
                 return_sequences=False,
                 dropout=0.2
             ),
@@ -1044,6 +960,7 @@ else:
 # Check if data is time-sorted
 print("Is sorted:", demand_matrix.index.is_monotonic_increasing)
 
+
 # ============================================================================
 # HELPER: GET ALREADY TRAINED SARIMA CLUSTERS
 # ============================================================================
@@ -1069,6 +986,11 @@ def get_already_trained_clusters(models_dir: str) -> set:
     logger.info(f"Found {len(trained_clusters)} already trained SARIMA clusters: {sorted(trained_clusters)[:5]}...")
     return trained_clusters
 
+def get_remaining_clusters_to_train(top_clusters, trained_clusters, config):
+    remaining = [c for c in top_clusters if str(c) not in trained_clusters]
+    logger.info(f"Total: {len(top_clusters)}, Trained: {len(trained_clusters)}, Remaining: {len(remaining)}")
+    return remaining
+
 # ============================================================================
 # HELPER: GET ALREADY TRAINED XGBOOST CLUSTERS
 # ============================================================================
@@ -1091,6 +1013,7 @@ def get_already_trained_xgboost_clusters(models_dir: str) -> set:
     
     logger.info(f"Found {len(trained_clusters)} already trained XGBoost clusters: {sorted(list(trained_clusters))[:5]}...")
     return trained_clusters
+
 
 # ============================================================================
 # HELPER: GET ALREADY TRAINED LSTM CHECKPOINT
@@ -1116,283 +1039,489 @@ def get_already_trained_lstm_checkpoint() -> bool:
     
     return False
 
+
 # ============================================================================
 # HELPER: PARALLEL SARIMA TASK
 # ============================================================================
-def fit_cluster_sarima_task(cluster, train_series, models_dir):
+
+def perform_acf_pacf_analysis(train_data, top_clusters, output_dir, n_clusters=5):
     """
-    Worker function to fit SARIMA for a single cluster in parallel.
-    Uses proven (0,1,1,168) Seasonal MA Only specification.
-    Saves model to disk immediately to save RAM.
+    Generate ACF/PACF plots to diagnose SARIMA parameters.
     
-    Based on successful implementation that trained 30 clusters in ~2 hours.
-    """
-    import os
-    import warnings
-    import gc
-    import joblib
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
-    from statsmodels.tools.sm_exceptions import ValueWarning
-    
-    # CRITICAL: Prevent oversubscription
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    os.environ['OPENBLAS_NUM_THREADS'] = '1'
-
-    # Silence warnings inside the worker process
-    warnings.simplefilter('ignore', category=ValueWarning)
-    warnings.simplefilter('ignore', category=FutureWarning)
-    warnings.simplefilter('ignore', category=UserWarning)
-
-    try:
-        # ENSURE FREQUENCY IS SET
-        if train_series.index.freq is None:
-            train_series = train_series.asfreq('h')
-
-        # Use proven (0,1,1,168) specification: Seasonal MA Only
-        # This captures weekly seasonal shocks without being memory-intensive
-        # AIC values from successful run: 17,000-18,000 range
-        
-        gc.collect()
-        
-        model = SARIMAX(
-            train_series,
-            order=(0, 1, 1),              # Non-seasonal: differencing + MA only
-            seasonal_order=(0, 1, 1, 168), # Seasonal: differencing + MA only (NO AR)
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        )
-
-        results = model.fit(
-            disp=False, 
-            maxiter=100,
-            low_memory=True
-        )
-
-        # Save to disk immediately
-        save_path = os.path.join(models_dir, f'sarima_model_{cluster}.pkl')
-        joblib.dump(results, save_path)
-
-        gc.collect()
-        return cluster, True, results.aic
-
-    except Exception as e:
-        return cluster, False, str(e)
-
-
-def get_remaining_clusters_to_train(topclusters, trained_clusters, config):
-    remaining = [c for c in topclusters if str(c) not in trained_clusters]
-    logger.info(f"Total: {len(topclusters)}, Trained: {len(trained_clusters)}, Remaining: {len(remaining)}")
-    return remaining
-
-def fit_cluster_pmdarima_task(cluster, train_series, models_dir):
-    """
-    Worker function to fit SARIMA using pmdarima.auto_arima for a single cluster.
-    Auto-selects order and seasonal order via stepwise search.
-    Handles NaN values and uses data windowing for memory efficiency.
-    Saves model to disk immediately to save RAM.
+    EXTENDED LAGS: Shows up to 336 lags (14 days) to clearly see:
+    - Lag 24 (daily seasonality)
+    - Lag 168 (weekly seasonality)
     
     Parameters
     ----------
-    cluster : str
-        Cluster identifier (e.g., '123' or 'T2S60')
-    train_series : pd.Series
-        Time series for this cluster with hourly frequency
-    models_dir : str
-        Directory where to save fitted model pickle
-    
-    Returns
-    -------
-    tuple
-        (cluster_name, success_bool, aic_or_error_msg)
+    train_data : pd.DataFrame
+        Training time series (hourly demand by cluster)
+    top_clusters : list
+        Cluster names to analyze
+    output_dir : str
+        Directory to save plots
+    n_clusters : int
+        Number of clusters to analyze (default: top 5)
     """
-    import os
-    import warnings
-    import joblib
-    import numpy as np
-    from pmdarima import auto_arima
     
-    # Prevent thread oversubscription
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    warnings.filterwarnings('ignore')
+    logger.info("="*80)
+    logger.info("STEP 2a: ACF/PACF DIAGNOSTIC ANALYSIS (Extended Lags)")
+    logger.info("="*80)
     
-    try:
-        # Ensure hourly frequency
-        if train_series.index.freq is None:
-            train_series = train_series.asfreq('h')
-        
-        # Handle NaN values: forward fill then backward fill
-        train_series = train_series.fillna(method='ffill').fillna(method='bfill')
-        
-        # Remove any remaining NaN values
-        train_series = train_series.dropna()
-        
-        # Check if series is empty after NaN removal
-        if len(train_series) == 0:
-            return cluster, False, "Series is empty after NaN removal"
-        
-        # Check for constant series (no variance)
-        if train_series.std() == 0:
-            return cluster, False, "Series is constant (zero variance)"
-        
-        # Recent data captures current seasonality patterns better than old data
-        max_hours = 4320  # 6 months * 30 days * 24 hours
-        if len(train_series) > max_hours:
-            train_series = train_series.iloc[-max_hours:]
-        
-        # Auto-fit SARIMA with optimized settings for NYC taxi hourly data
-        model = auto_arima(
-            train_series,
-            seasonal=True,            # Enable seasonal component
-            m=168,                    # Weekly seasonality (7 days * 24 hours)
-            
-            # ARIMA (p, d, q) parameters - conservative to reduce matrix size
-            start_p=0,                # Start AR search at 0
-            max_p=2,                  # Max AR order (search 0, 1, 2)
-            start_d=1,                # Start differencing at 1
-            max_d=2,                  # Max differencing (search 1, 2)
-            start_q=0,                # Start MA search at 0
-            max_q=2,                  # Max MA order (search 0, 1, 2)
-            
-            # Seasonal ARIMA (P, D, Q, m) parameters
-            start_P=0,                # Start seasonal AR at 0
-            max_P=0,                  # REDUCED: No seasonal AR (saves matrix size)
-            start_D=1,                # Start seasonal diff at 1
-            max_D=1,                  # Max seasonal differencing (fixed at 1)
-            start_Q=0,                # Start seasonal MA at 0
-            max_Q=1,                  # REDUCED: Max seasonal MA at 1 only (saves matrix size)
-            
-            # Search settings
-            stepwise=True,            # Efficient stepwise search
-            n_jobs=1,                 # MUST be 1 for stepwise
-            maxiter=100,              # Reduced from 150 for faster fitting
-            suppress_warnings=True,
-            error_action='ignore',    # Skip combinations that fail
-            trace=False               # No verbose output
-        )
-        
-        # Save model to disk immediately
-        save_path = os.path.join(models_dir, f"sarima_model_{cluster}.pkl")
-        joblib.dump(model, save_path)
-        
-        # Get AIC for logging
+    logger.info(f"Analyzing first {n_clusters} clusters for seasonal patterns...")
+    logger.info(f"Lag range: 0-336 hours (2 weeks) to capture:")
+    logger.info(f"  - Lag 24 (DAILY cycle - orange line)")
+    logger.info(f"  - Lag 168 (WEEKLY cycle - blue line)")
+    
+    for cluster_idx, cluster in enumerate(top_clusters[:n_clusters]):
         try:
-            aic = model.aic()
-        except:
-            aic = 0.0
+            logger.info(f"\n[{cluster_idx+1}/{n_clusters}] Analyzing cluster: {cluster}")
+            
+            series = train_data[cluster].dropna()
+            
+            if len(series) < 500:
+                logger.warning(f"[!] Cluster {cluster} has only {len(series)} samples (need >500)")
+                continue
+            
+            # Create figure with 4 subplots (larger to show extended lags)
+            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+            fig.suptitle(f'ACF/PACF Diagnostic Analysis - Cluster {cluster}\n' + 
+                        'Lags 0-336 (2 weeks) | Orange=24h daily, Blue=168h weekly', 
+                        fontsize=14, fontweight='bold')
+            
+            # ===== ORIGINAL DATA =====
+            # ACF on original (EXTENDED to 336 lags)
+            try:
+                plot_acf(series, lags=336, ax=axes[0, 0])
+                axes[0, 0].axvline(x=24, color='orange', linestyle='--', linewidth=2, 
+                                   alpha=0.7, label='Lag 24 (daily)')
+                axes[0, 0].axvline(x=168, color='blue', linestyle='--', linewidth=2, 
+                                   alpha=0.7, label='Lag 168 (weekly)')
+                axes[0, 0].set_title(f'ACF (Original Data)\nCluster: {cluster}', fontsize=11)
+                axes[0, 0].legend(loc='upper right')
+                axes[0, 0].grid(True, alpha=0.3)
+                axes[0, 0].set_xlabel('Lag (hours)')
+                axes[0, 0].set_ylabel('ACF')
+            except Exception as e:
+                logger.warning(f"ACF failed: {e}")
+                axes[0, 0].text(0.5, 0.5, f'ACF Error: {str(e)[:50]}', ha='center')
+            
+            # PACF on original (EXTENDED to 336 lags)
+            try:
+                plot_pacf(series, lags=336, ax=axes[0, 1])
+                axes[0, 1].axvline(x=24, color='orange', linestyle='--', linewidth=2, 
+                                   alpha=0.7, label='Lag 24 (daily)')
+                axes[0, 1].axvline(x=168, color='blue', linestyle='--', linewidth=2, 
+                                   alpha=0.7, label='Lag 168 (weekly)')
+                axes[0, 1].set_title('PACF (Original Data)', fontsize=11)
+                axes[0, 1].legend(loc='upper right')
+                axes[0, 1].grid(True, alpha=0.3)
+                axes[0, 1].set_xlabel('Lag (hours)')
+                axes[0, 1].set_ylabel('PACF')
+            except Exception as e:
+                logger.warning(f"PACF failed: {e}")
+                axes[0, 1].text(0.5, 0.5, f'PACF Error: {str(e)[:50]}', ha='center')
+            
+            # ===== DIFFERENCED DATA (d=1) =====
+            series_diff = series.diff().dropna()
+            
+            # ACF on differenced (EXTENDED to 336 lags)
+            try:
+                plot_acf(series_diff, lags=336, ax=axes[1, 0])
+                axes[1, 0].axvline(x=24, color='orange', linestyle='--', linewidth=2, 
+                                   alpha=0.7, label='Lag 24 (daily)')
+                axes[1, 0].axvline(x=168, color='blue', linestyle='--', linewidth=2, 
+                                   alpha=0.7, label='Lag 168 (weekly)')
+                axes[1, 0].set_title('ACF (After d=1 Differencing)', fontsize=11)
+                axes[1, 0].legend(loc='upper right')
+                axes[1, 0].grid(True, alpha=0.3)
+                axes[1, 0].set_xlabel('Lag (hours)')
+                axes[1, 0].set_ylabel('ACF')
+            except Exception as e:
+                logger.warning(f"ACF diff failed: {e}")
+                axes[1, 0].text(0.5, 0.5, f'ACF Error: {str(e)[:50]}', ha='center')
+            
+            # PACF on differenced (EXTENDED to 336 lags)
+            try:
+                plot_pacf(series_diff, lags=336, ax=axes[1, 1])
+                axes[1, 1].axvline(x=24, color='orange', linestyle='--', linewidth=2, 
+                                   alpha=0.7, label='Lag 24 (daily)')
+                axes[1, 1].axvline(x=168, color='blue', linestyle='--', linewidth=2, 
+                                   alpha=0.7, label='Lag 168 (weekly)')
+                axes[1, 1].set_title('PACF (After d=1 Differencing)', fontsize=11)
+                axes[1, 1].legend(loc='upper right')
+                axes[1, 1].grid(True, alpha=0.3)
+                axes[1, 1].set_xlabel('Lag (hours)')
+                axes[1, 1].set_ylabel('PACF')
+            except Exception as e:
+                logger.warning(f"PACF diff failed: {e}")
+                axes[1, 1].text(0.5, 0.5, f'PACF Error: {str(e)[:50]}', ha='center')
+            
+            plt.tight_layout()
+            
+            # Save with safe filename
+            safe_cluster = str(cluster).replace('/', '_').replace('\\\\', '_')
+            output_path = os.path.join(output_dir, f'acf_pacf_{safe_cluster}.png')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"[OK] ACF/PACF plot saved: {output_path}")
+            
+            # Log interpretation guidance
+            logger.info(f"[DIAGNOSTIC HINTS] For {cluster}:")
+            logger.info(f"  1. ORIGINAL DATA (top plots):")
+            logger.info(f"     - Spikes at lag 24 = DAILY pattern (try m=24)")
+            logger.info(f"     - Spikes at lag 168 = WEEKLY pattern (try m=168)")
+            logger.info(f"     - Slow decay = NON-STATIONARY (confirms d=1 needed)")
+            logger.info(f"  2. AFTER d=1 DIFFERENCING (bottom plots):")
+            logger.info(f"     - Much smaller spikes = d=1 is effective [OK]")
+            logger.info(f"     - Sharp cutoff after lag ~5 = MA term needed (q=1 or q=2)")
+            logger.info(f"     - Single spike at lag 1 in PACF = AR(1) or MA(1)")
+            logger.info(f"  3. SEASONAL COMPONENT:")
+            logger.info(f"     - Spikes near lag 24 multiples = m=24 (daily)")
+            logger.info(f"     - Spikes near lag 168 multiples = m=168 (weekly)")
+            logger.info(f"     - TRY BOTH with auto_arima, pick lower AIC")
+            
+        except Exception as e:
+            logger.error(f"[X] ACF/PACF analysis failed for {cluster}: {e}")
+            continue
+    
+    logger.info("\n" + "="*80)
+    logger.info("[OK] ACF/PACF diagnostic analysis completed")
+    logger.info(f"[INFO] Plots saved to: {output_dir}")
+    logger.info("="*80)
+
+# Call BEFORE SARIMA training
+if not checkpoint_mgr.is_complete('acf_pacf_analysis_done'):
+    perform_acf_pacf_analysis(train_data, top_clusters, VIZ_DIR, n_clusters=5)
+    checkpoint_mgr.mark_complete('acf_pacf_analysis_done')
+
+
+# ============================================================================
+# DIAGNOSTIC: STATIONARITY TEST (ADF) - FIXED VERSION
+# ============================================================================
+
+def perform_adf_tests(train_data, top_clusters, n_clusters=5):
+    """
+    Perform Augmented Dickey-Fuller test to check stationarity.
+    
+    FIXED: Handles different return formats from statsmodels versions.
+    
+    Interprets:
+    - p-value <= 0.05: STATIONARY (no differencing needed)
+    - p-value > 0.05: NON-STATIONARY (differencing needed)
+    """
+    
+    
+    logger.info("="*80)
+    logger.info("STEP 2b: STATIONARITY TEST (ADF) - FIXED")
+    logger.info("="*80)
+    
+    adf_results = []
+    
+    for cluster_idx, cluster in enumerate(top_clusters[:n_clusters]):
+        try:
+            series = train_data[cluster].dropna()
+            
+            if len(series) < 100:
+                logger.warning(f"[!] {cluster} has only {len(series)} samples (need >100)")
+                continue
+            
+            # Perform ADF test
+            result = adfuller(series, autolag='AIC')
+            
+            # FIXED: Extract p-value safely (handles different return formats)
+            adf_stat = float(result[0])
+            p_value = float(result[1])
+            lags_used = int(result[2]) 
+
+            # Validate p-value is in reasonable range
+            if not (0.0 <= p_value <= 1.0):
+                logger.warning(f"    P-value out of range: {p_value}, using default non-stationary")
+                p_value = 0.99
+
+            is_stationary = p_value <= 0.05
+            
+            logger.info(f"\n[{cluster_idx+1}/{n_clusters}] {cluster}")
+            logger.info(f"  ADF Statistic: {adf_stat:.6f}")
+            logger.info(f"  p-value: {p_value:.6f}")
+            logger.info(f"  Lags used: {lags_used}")
+            
+            if is_stationary:
+                logger.info(f"  [+] STATIONARY (p={p_value:.4f})")
+                logger.info(f"      Recommendation: d=0 or d=1")
+            else:
+                logger.info(f"  [-] NON-STATIONARY (p={p_value:.4f})")
+                logger.info(f"      Recommendation: d=1 or d=2 (d=1 usually sufficient)")
+            
+            adf_results.append({
+                'cluster': cluster,
+                'adf_statistic': adf_stat,
+                'p_value': p_value,
+                'is_stationary': is_stationary,
+                'lags_used': lags_used
+            })
+            
+        except Exception as e:
+            logger.warning(f"[!] ADF test failed for {cluster}: {type(e).__name__}: {str(e)[:100]}")
+            continue
+    
+    # Summary and recommendations
+    if len(adf_results) > 0:
+        adf_df = pd.DataFrame(adf_results)
+        stationary_count = sum(1 for r in adf_results if r['is_stationary'])
         
-        return cluster, True, aic
+        logger.info("\n" + "="*80)
+        logger.info(f"[SUMMARY] {stationary_count}/{len(adf_results)} clusters are STATIONARY")
+        logger.info("="*80)
         
-    except Exception as e:
-        return cluster, False, str(e)
+        if stationary_count == len(adf_results):
+            logger.info("[RECOMMENDATION] All stationary")
+            logger.info("  -> Use d=0 (no differencing needed)")
+        elif stationary_count == 0:
+            logger.info("[RECOMMENDATION] All non-stationary")
+            logger.info("  -> Use d=1 (first differencing)")
+            logger.info("  -> Rarely need d=2")
+        else:
+            logger.info("[RECOMMENDATION] Mixed results")
+            logger.info("  -> Use d=1 as default (works for both cases)")
+            logger.info("  -> auto_arima will search between d=1 and d=2")
+        
+        logger.info("\n[ACTION] For auto_arima:")
+        logger.info("  max_d=1 or max_d=2 (based on ADF results above)")
+        logger.info("  max_D=1 (seasonal differencing - always 1 for m=168)")
+        
+        return adf_df
+    else:
+        logger.warning("[!] No ADF tests completed successfully")
+        return pd.DataFrame()
+
+
+# Call BEFORE SARIMA training
+if not checkpoint_mgr.is_complete('adf_analysis_done'):
+    adf_df = perform_adf_tests(train_data, top_clusters, n_clusters=5)
+    checkpoint_mgr.save_checkpoint('adf_results', adf_df)
+    checkpoint_mgr.mark_complete('adf_analysis_done')
+
 # =========================================================================
 # STEP 3 SARIMA MODELS - PARALLEL OPTIMIZED
 # =========================================================================
 
-print("=" * 80)
-print("STEP 3: SARIMA MODELS - PARALLEL OPTIMIZED")
-print("=" * 80)
+print("\n" + "="*80)
+print("STEP 3: SARIMA MODELS - GRID SEARCH + RESUMABLE FITTING")
+print("="*80)
 
 if not checkpoint_mgr.is_complete('sarima_fitted'):
-    # Check which clusters are already trained
-    trained_clusters = get_already_trained_clusters(MODELS_DIR)
-    clusters_to_train = get_remaining_clusters_to_train(top_clusters, trained_clusters, config)
+
+    # ===== PHASE 1: GRID SEARCH (RUN ONCE) =====
+    if not checkpoint_mgr.is_complete('sarima_grid_search'):
+        
+        print("\nPHASE 1: Grid search on top 3 clusters")
+        print("Note: This runs ONCE. Best params will be saved and reused on resume.")
+        
+        start_time = datetime.now()
+        grid_results = []
+        
+        for idx, cluster in enumerate(top_clusters[:1], 1):
+            print(f"\n[{idx}/3 {cluster} - Grid searching 36 combinations...")
+            
+            sarima = SARIMAPredictor(cluster)
+            result = sarima.grid_search_params(
+                train_data[cluster],
+                d_fixed=0,
+                D_fixed=1,
+                m=168
+            )
+            
+            save_path = os.path.join(MODELS_DIR, f"sarima_model_{cluster}.pkl")
+            joblib.dump(sarima, save_path)
+            
+            grid_results.append({
+                'cluster': cluster,
+                'order': result['order'],
+                'seasonal_order': result['seasonal_order'],
+                'aic': result['aic']
+            })
+            print(f"  [ok] Saved: {save_path}")
+        
+        phase1_time = (datetime.now() - start_time).total_seconds() / 60
+        
+        # ===== SELECT BEST PARAMETERS FROM TOP 3 =====
+        results_df = pd.DataFrame(grid_results)
+        best_idx = results_df['aic'].idxmin()
+        
+        best_cluster = results_df.loc[best_idx, 'cluster']
+        best_order = results_df.loc[best_idx, 'order']
+        best_seasonal = results_df.loc[best_idx, 'seasonal_order']
+        best_aic = results_df.loc[best_idx, 'aic']
+        
+        print(f"\n{'='*60}")
+        print(f"PHASE 1 COMPLETE - BEST PARAMETERS FOUND:")
+        print(f"  Best cluster: {best_cluster}")
+        print(f"  Order: {best_order}")
+        print(f"  Seasonal: {best_seasonal}")
+        print(f"  AIC: {best_aic:.2f}")
+        print(f"  Time: {phase1_time:.1f} minutes")
+        print(f"{'='*60}")
+        
+        # Save best parameters to checkpoint (critical!)
+        checkpoint_mgr.save_checkpoint('sarima_best_params', {
+            'best_order': best_order,
+            'best_seasonal': best_seasonal,
+            'best_aic': best_aic,
+            'best_from_cluster': best_cluster
+        })
+        checkpoint_mgr.mark_complete('sarima_grid_search')
+        logger.info("[OK] Grid search checkpoint saved - will reuse on resume")
     
-    logger.info(f"Total clusters to train: {len(top_clusters)}")
-    logger.info(f"Already trained: {len(trained_clusters)}")
-    logger.info(f"Remaining to train: {len(clusters_to_train)}")
+    else:
+        # ===== RESUME: LOAD BEST PARAMS FROM CHECKPOINT =====
+        print("\nPHASE 1: Loading best parameters from previous grid search...")
+        
+        grid_checkpoint = checkpoint_mgr.load_checkpoint('sarima_best_params')
+        best_order = tuple(grid_checkpoint['best_order'])
+        best_seasonal = tuple(grid_checkpoint['best_seasonal'])
+        best_aic = grid_checkpoint['best_aic']
+        best_cluster = grid_checkpoint['best_from_cluster']
+        
+        print(f"  Loaded best cluster: {best_cluster}")
+        print(f"  Loaded best order: {best_order}")
+        print(f"  Loaded best seasonal: {best_seasonal}")
+        print(f"  Loaded best AIC: {best_aic:.2f}")
+        print(f"  [ok] Grid search skipped (already completed)")
     
-    # 1. Load existing models (Lightweight metadata only if possible, but we load full for consistency)
-    sarima_models = {}
-    fitted_sarima = {}
+    # ===== PHASE 2: RESUMABLE FITTING ON REMAINING CLUSTERS =====
+    print(f"\n{'='*60}")
+    print(f"PHASE 2: Resumable Training - Checking which clusters are done...")
+    print(f"{'='*60}")
     
-    # Load previously trained models
-    if trained_clusters:
-        logger.info(f"Loading {len(trained_clusters)} already trained models...")
-        for cluster in trained_clusters:
+    start_time = datetime.now()
+    
+    # ===== USE HELPER FUNCTIONS =====
+    # Get already trained clusters from MODELS_DIR
+    already_trained = get_already_trained_clusters(MODELS_DIR)
+    
+    # Get remaining clusters to train
+    # Note: top_clusters already contains all clusters in order of importance
+    remaining_clusters = get_remaining_clusters_to_train(top_clusters, already_trained, config)
+    
+    # Get all clusters for final count
+    cluster_pattern = re.compile(r'^T\d+_S\d+$')
+    all_clusters = [col for col in train_data.columns if cluster_pattern.match(col)]
+    
+    print(f"\nTraining Status:")
+    print(f"  Total clusters: {len(all_clusters)}")
+    print(f"  Already trained: {len(already_trained)}")
+    print(f"  Remaining to train: {len(remaining_clusters)}")
+    
+    if len(remaining_clusters) > 0:
+        print(f"\nApplying {best_order} x {best_seasonal} to {len(remaining_clusters)} clusters...")
+        
+        def fit_cluster_with_best_params(cluster_name):
+            """Worker: Fit one cluster with best parameters."""
             try:
-                model_path = os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl')
-                if os.path.exists(model_path):
-                    # We only load to memory if we really need them now. 
-                    # For Step 6, we might reload them anyway. 
-                    # To save RAM during training, you could SKIP loading here and just load in Step 6.
-                    # But sticking to your logic:
-                    results = joblib.load(model_path)
-                    sarima_models[str(cluster)] = SARIMAPredictor(str(cluster))
-                    sarima_models[str(cluster)].fitted = True
-                    fitted_sarima[str(cluster)] = results
+                sarima = SARIMAPredictor(cluster_name)
+                sarima.fit_with_params(train_data[cluster_name], best_order, best_seasonal)
+
+                # Validate model actually fitted
+                if sarima.results is None:
+                    return cluster_name, False, "Model object is None (fitting failed silently)"
+                
+                if sarima.results.aic is None:
+                    return cluster_name, False, "AIC is None (invalid model)"
+
+                if not np.isfinite(sarima.results.aic):
+                    return cluster_name, False, f"AIC is invalid: {sarima.results.aic}"
+                
+                save_path = os.path.join(MODELS_DIR, f"sarima_model_{cluster_name}.pkl")
+                joblib.dump(sarima, save_path)
+                
+                return cluster_name, True, sarima.results.aic
             except Exception as e:
-                logger.warning(f"Could not reload {cluster}: {e}")
-
-    # 2. Train remaining clusters in PARALLEL
-    if clusters_to_train:
-        logger.info(f"Starting parallel training for {len(clusters_to_train)} clusters...")
+                return cluster_name, False, str(e)[:80]
         
-        # Execute parallel training
-        # n_jobs=-1 uses all available cores. 
-        # backend='loky' is robust for statsmodels.
-        logger.info("Using statsmodels SARIMA (0,1,1)x(0,1,1,168) - Seasonal MA Only")
-        worker_func = fit_cluster_sarima_task
-
-        parallel_results = Parallel(n_jobs=2, backend='loky', verbose=10)(
-            delayed(worker_func)(cluster, train_data[cluster], MODELS_DIR)
-            for cluster in clusters_to_train
+        # Parallel execution (all cores for Ryzen 7 9800X3D)
+        parallel_results = Parallel(n_jobs=-1, backend='loky', verbose=10)(
+            delayed(fit_cluster_with_best_params)(cluster) 
+            for cluster in remaining_clusters
         )
-        
-        # Process results
-        success_count = 0
-        for cluster, success, payload in parallel_results:
-            if success:
-                success_count += 1
-                logger.info(f"[OK] Cluster {cluster} fitted (AIC={payload:.2f})")
-                
-                # Reload the lightweight object if needed for the dictionary
-                # (Or just mark it as done, since it's already on disk)
-                sarima_models[str(cluster)] = SARIMAPredictor(str(cluster))
-                sarima_models[str(cluster)].fitted = True
-                
-                # OPTIONAL: Load result into memory only if you have >32GB RAM or small models.
-                # If OOM happens, comment this line out and load lazily in Step 6.
-                # fitted_sarima[str(cluster)] = joblib.load(os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl'))
-            else:
-                logger.error(f"[X] Cluster {cluster} failed: {payload}")
-                
-        logger.info(f"Parallel training completed. Success: {success_count}/{len(clusters_to_train)}")
-        
-        # Reload newly trained models into memory for consistency with the pipeline flow
-        # (Doing this sequentially is safer for RAM than returning them all from parallel workers)
-        logger.info("Reloading newly trained models for pipeline state...")
-        for cluster, success, _ in parallel_results:
-            if success:
-                try:
-                    path = os.path.join(MODELS_DIR, f'sarima_model_{cluster}.pkl')
-                    fitted_sarima[str(cluster)] = joblib.load(path)
-                except:
-                    pass
 
-    # Save final state (lightweight dictionaries)
-    # Note: We don't pickle the full 'fitted_sarima' into the state file if it's huge.
-    # It's better to rely on the .pkl files in MODELS_DIR.
-    # But following your pattern:
-    checkpoint_mgr.save_checkpoint('sarima_models', sarima_models)
-    # checkpoint_mgr.save_checkpoint('fitted_sarima', fitted_sarima) # CAREFUL: This might be huge.
+        success_results = []
+        failed_results = []
+
+        for cluster_name, success, value in parallel_results:
+            if success:
+                success_results.append((cluster_name, value))
+            else:
+                failed_results.append((cluster_name, value))
+
+        success_count = len(success_results)
+        failed_count = len(failed_results)
+        
+        phase2_time = (datetime.now() - start_time).total_seconds() / 60
+        
+        # Summary
+        success_count = sum(1 for _, success, _ in parallel_results if success)
+        failed_count = len(parallel_results) - success_count
+        total_now = len(already_trained) + success_count
+        
+        if failed_count > 0:
+            failed_clusters = [c for c, _ in failed_results]
+            print(f"\n[!] Failed in this batch: {failed_clusters}")
+            for cluster_name, reason in failed_results:
+                print(f"    {cluster_name}: {reason}")
+        
+        print(f"\n{'='*60}")
+        print(f"PHASE 2 SUMMARY:")
+        print(f"  Trained in this run: {success_count}")
+        print(f"  Failed in this run: {failed_count}")
+        print(f"  Time: {phase2_time:.1f} minutes")
+        print(f"{'='*60}")
     
-    # Better to just mark complete and reload from disk in Step 6
-    checkpoint_mgr.mark_complete('sarima_fitted')
+    else:
+        print(f"\n  All clusters already trained!")
+        phase2_time = 0
+        total_now = len(already_trained)
     
-    # Cleanup
-    gc.collect()
+    # Final count - re-check to be sure
+    final_trained = get_already_trained_clusters(MODELS_DIR)
+    total_final = len(final_trained)
+    
+    print(f"\n{'='*60}")
+    print(f"STEP 3 STATUS - SARIMA MODELS")
+    print(f"{'='*60}")
+    print(f"  Total models saved: {total_final}/{len(all_clusters)}")
+    print(f"  Phase 1 (Grid search): One-time execution")
+    if len(remaining_clusters) > 0:
+        print(f"  Phase 2 (Parallel fit): {phase2_time:.1f} min")
+    else:
+        print(f"  Phase 2 (Parallel fit): Skipped (all done)")
+    print(f"  Best parameters: {best_order} x {best_seasonal}")
+    print(f"  Saved to: {MODELS_DIR}")
+    
+    if total_final == len(all_clusters):
+        print(f"  Status: [ok] COMPLETE! All {len(all_clusters)} clusters trained")
+        checkpoint_mgr.mark_complete('sarima_fitted')
+        logger.info("[OK] SARIMA training completed and checkpointed!")
+    else:
+        print(f"  Status: RESUMABLE ({total_final}/{len(all_clusters)})")
+        logger.info(f"[+] SARIMA checkpoint saved ({total_final}/{len(all_clusters)}) - run again to continue")
+    
+    print(f"{'='*60}\n")
+    
+    # Save final checkpoint
+    checkpoint_mgr.save_checkpoint('sarima_models', {
+        'best_order': best_order,
+        'best_seasonal': best_seasonal,
+        'best_aic': best_aic,
+        'best_from_cluster': best_cluster,
+        'total_trained': total_final,
+        'total_clusters': len(all_clusters)
+    })
 
 else:
-    print("[OK] SARIMA models already fitted from checkpoint")
-    # 1. Find trained models (only scan filenames, don't load)
-    trained_sarima_clusters = get_already_trained_clusters(MODELS_DIR)
-    logger.info(f"Found {len(trained_sarima_clusters)} already trained SARIMA clusters: {sorted(list(trained_sarima_clusters))[:5]}...")
-    
-    # 2. NO LOADING into fitted_sarima dictionary
-    fitted_sarima = {}  # Empty! Models loaded on-demand during prediction
+    print("\n[OK] SARIMA training marked as complete (checkpoint found)")
+    print("Skipping STEP 3\n")
 
 gc.collect()
 
@@ -1405,13 +1534,9 @@ def fit_cluster_xgboost_task(cluster, X_train, y_train_cluster, X_val, y_val_clu
     """
     # CRITICAL: Control threads per worker
     # 4 workers in parallel, each worker 4 threads
-    import os
     os.environ['OMP_NUM_THREADS'] = '4'
     
-    try:
-        from xgboost import XGBRegressor
-        import joblib
-        
+    try:        
         model = XGBRegressor(
             objective='reg:squarederror',
             random_state=42,
@@ -1612,7 +1737,7 @@ if not checkpoint_mgr.is_complete('xgboost_fitted'):
     tuned_params_list = [params for params in best_params_by_cluster.values()]
 
     if tuned_params_list:
-        from collections import Counter
+
         
         derived_default_params = {}
         # Use keys from the first parameter dictionary
@@ -2042,8 +2167,6 @@ if not checkpoint_mgr.is_complete('pca_visualizations_created'):
         X_train_pca = pca_model.transform(X_train)
         X_train_scaled = scaler.transform(X_train_pca)
         
-        from pca_visualizer import PCAVisualizer
-        
         pca_viz = PCAVisualizer(
             pca_model=pca_model,
             X_original_shape=X_train.shape,
@@ -2077,9 +2200,6 @@ def calculate_metrics_for_single_cluster(
     common_clusters
 ):
     """Calculate metrics for a single cluster (worker function for parallelization)."""
-    import numpy as np
-    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, median_absolute_error
-    import logging
     
     logger = logging.getLogger(__name__)
     cluster_metrics = {"SARIMA": {}, "XGBoost": {}, "LSTM": {}}
@@ -2239,7 +2359,7 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
         logger.error(f"[X] xgb_optimizer.models has {len(xgb_optimizer.models)} models")
         raise
     
-    # ============ SARIMA PREDICTIONS (LAZY LOADING) ============
+    # ============ SARIMA PREDICTIONS (FIXED FOR CUSTOM WRAPPER) ============
     logger.info("Making SARIMA predictions (lazy loading from disk)...")
     logger.info(f"Note: Using multi-step forecast without refitting")
     
@@ -2260,21 +2380,34 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
             if not os.path.exists(model_path):
                 continue
                 
-            # 1. Load model
-            sarima_results = joblib.load(model_path)
+            # 1. Load model wrapper (SARIMAPredictor instance)
+            model_wrapper = joblib.load(model_path)
             
             # 2. Forecast
-            # Ensure we don't predict more steps than we have test data for
+            # Your custom wrapper returns numpy array directly!
             steps = len(test_data)
-            forecast_result = sarima_results.get_forecast(steps=steps)
-            preds = forecast_result.predicted_mean.values
+            preds = model_wrapper.forecast(steps=steps)
             
-            # 3. Store result
+            # 3. Validation & Shape Correction
+            # Ensure it's a 1D array
+            if isinstance(preds, pd.Series):
+                preds = preds.values
+            preds = np.asarray(preds).flatten()
+            
+            # Pad or trim if length mismatch (defensive coding)
+            if len(preds) != steps:
+                if len(preds) > steps:
+                    preds = preds[:steps]
+                else:
+                    padding = np.full(steps - len(preds), np.nan)
+                    preds = np.concatenate([preds, padding])
+            
+            # 4. Store result
             sarima_predictions[cluster_name] = preds
             
-            # 4. CRITICAL: Clear memory
-            del sarima_results
-            del forecast_result
+            # 5. Clear memory
+            del model_wrapper
+            del preds
             
             # periodic GC
             if (cluster_idx + 1) % 50 == 0:
@@ -2445,7 +2578,7 @@ if not checkpoint_mgr.is_complete('models_evaluated'):
     logger.info(f"[INFO] Starting parallel metrics calculation with 8 workers...")
     logger.info(f"[INFO] Processing {len(common_clusters)} clusters in parallel")
 
-    cluster_metrics_list = Parallel(n_jobs=8, backend='loky', verbose=10)(
+    cluster_metrics_list = Parallel(n_jobs=8, backend='loky', verbose=10, batch_size=8)(
         delayed(calculate_metrics_for_single_cluster)(
             idx,
             cluster,
@@ -2493,66 +2626,148 @@ print("\n" + "="*80)
 print("STEP 7: VISUALIZATIONS")
 print("="*80)
 
-def plot_forecasting_degradation(metrics_results, output_dir):
+def plot_forecasting_degradation_span_aware(metrics_results, output_dir):
     """
-    Visualize how forecast accuracy degrades over time (1-day vs 3-day vs 7-day).
+    Same as above but preserves span-specific aggregation,
+    so you actually see degradation *across* 1-day -> 3-day -> 7-day.
     """
-    logger.info("Creating forecasting degradation analysis...")
+    logger.info("Creating forecasting degradation analysis (span-aware)...")
     
-    # Aggregating data
     models = ['SARIMA', 'XGBoost', 'LSTM']
     spans = [1, 3, 7]
-    metrics = ['RMSE', 'MAE', 'MAPE']
+    metrics = ['rmse', 'mae', 'mape']
     
-    degradation_data = {m: {model: [] for model in models} for m in metrics}
+    # Now: degradation_data[metric][model][span] = [list of values]
+    degradation_data = {
+        metric: {
+            model: {span: [] for span in spans}
+            for model in models
+        }
+        for metric in metrics
+    }
     
-    # Calculate averages across all clusters
-    for model in models:
-        for span in spans:
-            for metric in metrics:
-                key = f'{span}d_{metric}'
-                # Extract values from all clusters
-                values = [
-                    metrics_results[c].get(model, {}).get(key, np.nan) 
-                    for c in metrics_results.keys()
-                ]
-                # Store mean
-                degradation_data[metric][model].append(np.nanmean(values))
-
-    # Create Plot
+    # ===== ITERATE & COLLECT SPAN-SPECIFIC VALUES =====
+    for cluster, models_metrics in metrics_results.items():
+        for model in models:
+            if model not in models_metrics:
+                continue
+            
+            cluster_model_metrics = models_metrics[model]
+            
+            for span in spans:
+                for metric in metrics:
+                    key = f'{span}d_{metric}'
+                    
+                    if key in cluster_model_metrics:
+                        value = cluster_model_metrics[key]
+                        if value is not None and not np.isnan(value):
+                            degradation_data[metric][model][span].append(value)
+    
+    # ===== PLOT WITH PROPER SPAN DEGRADATION =====
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.patch.set_facecolor('white')
+    
+    colors = {
+        'SARIMA': '#FF6B6B',
+        'XGBoost': '#4ECDC4',
+        'LSTM': '#45B7D1'
+    }
     
     for idx, metric in enumerate(metrics):
         ax = axes[idx]
         x = np.arange(len(spans))
         width = 0.25
         
-        # Plot bars for each model
         for i, model in enumerate(models):
             offset = (i - 1) * width
-            values = degradation_data[metric][model]
-            ax.bar(x + offset, values, width, label=model, alpha=0.8)
             
-            # Add trend lines
-            ax.plot(x + offset, values, marker='o', linestyle='-', linewidth=1, alpha=0.5)
-
-        ax.set_title(f'{metric} Degradation over Time', fontsize=12, fontweight='bold')
+            # Get mean for each span
+            values_per_span = [
+                np.nanmean(degradation_data[metric][model][span])
+                if degradation_data[metric][model][span]
+                else np.nan
+                for span in spans
+            ]
+            
+            # Only plot if we have non-NaN values
+            if any(not np.isnan(v) for v in values_per_span):
+                bars = ax.bar(
+                    x + offset,
+                    values_per_span,
+                    width,
+                    label=model,
+                    alpha=0.85,
+                    color=colors.get(model, 'gray'),
+                    edgecolor='black',
+                    linewidth=0.5
+                )
+                
+                # Add value labels on bars
+                for bar in bars:
+                    height = bar.get_height()
+                    if not np.isnan(height) and height > 0:
+                        ax.text(
+                            bar.get_x() + bar.get_width() / 2.,
+                            height,
+                            f'{height:.4f}',
+                            ha='center',
+                            va='bottom',
+                            fontsize=8
+                        )
+                
+                # Add trend line to show degradation
+                ax.plot(
+                    x + offset,
+                    values_per_span,
+                    marker='o',
+                    linestyle='--',
+                    linewidth=1.5,
+                    alpha=0.6,
+                    markersize=6,
+                    color=colors.get(model, 'gray')
+                )
+        
+        ax.set_title(
+            f'{metric.upper()} Degradation over Time',
+            fontsize=13,
+            fontweight='bold',
+            pad=10
+        )
         ax.set_xticks(x)
-        ax.set_xticklabels([f'{s}-Day' for s in spans])
-        ax.set_xlabel('Forecast Horizon')
-        ax.set_ylabel(f'Average {metric}')
-        ax.grid(True, alpha=0.3)
+        ax.set_xticklabels(
+            [f'{s}-Day' for s in spans],
+            fontsize=11
+        )
+        ax.set_xlabel('Forecast Horizon', fontsize=11, fontweight='bold')
+        ax.set_ylabel(f'Average {metric.upper()}', fontsize=11, fontweight='bold')
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        ax.set_axisbelow(True)
+        
         if idx == 0:
-            ax.legend()
-            
-    plt.suptitle('Model Performance Degradation: Short vs Long Term', fontsize=16, y=1.05)
+            ax.legend(loc='upper left', fontsize=10, framealpha=0.95)
+    
+    plt.suptitle(
+        'Model Performance Degradation: Short vs Long Term',
+        fontsize=16,
+        fontweight='bold',
+        y=0.98
+    )
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'forecasting_degradation.png'), dpi=300, bbox_inches='tight')
+    
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, 'forecasting_degradation.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
+    logger.info(f"[OK] Degradation plot saved to {output_path}")
     plt.close()
-    logger.info("[OK] Degradation plot saved")
+    
+    return degradation_data
 
-# === CALL THE FUNCTION ===
-plot_forecasting_degradation(metrics_results, VIZ_DIR)
+
+# === CALL (RECOMMENDED VERSION) ===
+degradation_data = plot_forecasting_degradation_span_aware(
+    metrics_results,
+    VIZ_DIR
+)
 
 def create_individual_forecast_plots(
     top_clusters,
@@ -2592,18 +2807,12 @@ def create_individual_forecast_plots(
     Returns:
     --------
     None (saves files to disk)
-    """
-    
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    
+    """    
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"\n{'='*80}")
-    print(f"Creating individual forecast comparison plots...")
+    print("Creating individual forecast comparison plots...")
     print(f"{'='*80}")
     print(f"Output directory: {output_dir}")
     print(f"Total clusters: {len(top_clusters)}\n")
@@ -2663,7 +2872,7 @@ def create_individual_forecast_plots(
             fig, ax = plt.subplots(figsize=(14, 6))
             
             # First 100 timesteps
-            max_steps = min(100, len(actual))
+            max_steps = min(170, len(actual))
             time_steps = np.arange(max_steps)
             actual_plot = actual[:max_steps]
             
@@ -2715,7 +2924,7 @@ def create_individual_forecast_plots(
             plt.savefig(filepath, dpi=150, bbox_inches='tight')
             plt.close()
             
-            print(f"  [{idx:2d}/{len(top_clusters)}] ✓ {filename}")
+            print(f"  [{idx:2d}/{len(top_clusters)}] [OK] {filename}")
             successful += 1
             
         except Exception as e:
@@ -2725,76 +2934,151 @@ def create_individual_forecast_plots(
     
     # Summary
     print(f"\n{'='*80}")
-    print(f"✓ Successful: {successful} | ✗ Failed: {failed}")
+    print(f"[OK] Successful: {successful} | ✗ Failed: {failed}")
     print(f"Saved to: {output_dir}")
     print(f"{'='*80}\n")
 
 if not checkpoint_mgr.is_complete('visualizations_created'):
     progress.update(80, "Creating visualizations")
     
-    # Plot 1: Enhanced Model Comparison with All Metrics
+    # Plot 1: Enhanced Model Comparison with All Metrics (WITH VALUE LABELS)
+
+if metrics_results:
+    first_cluster = list(metrics_results.keys())[0]
+    metrics_df = pd.DataFrame(metrics_results[first_cluster]).T
     
-    if metrics_results:
-        first_cluster = list(metrics_results.keys())[0]
-        metrics_df = pd.DataFrame(metrics_results[first_cluster]).T
+    metrics_to_plot = ['RMSE', 'MAE', 'MAPE', 'R2', 'Median_AE']
+    metrics_available = [m for m in metrics_to_plot if m in metrics_df.columns]
+    
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    axes = axes.flatten()
+    
+    for idx, metric in enumerate(metrics_available):
+        ax = axes[idx]
+        values = metrics_df[metric]
         
-        metrics_to_plot = ['RMSE', 'MAE', 'MAPE', 'R2', 'Median_AE']
-        metrics_available = [m for m in metrics_to_plot if m in metrics_df.columns]
+        # Use log scale for MAPE if values are large
+        if metric == 'MAPE' and values.max() > 1000:
+            ax.set_yscale('log')
+            title_suffix = ' (log scale)'
+        else:
+            title_suffix = ''
         
-        fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-        axes = axes.flatten()
+        bars = values.plot(kind='bar', ax=ax, color=['#1f77b4', '#ff7f0e', '#2ca02c'], 
+                           edgecolor='black', linewidth=1.5, alpha=0.85)
         
-        for idx, metric in enumerate(metrics_available):
-            ax = axes[idx]
-            values = metrics_df[metric]
-            
-            # Use log scale for MAPE if values are large
-            if metric == 'MAPE' and values.max() > 1000:
-                ax.set_yscale('log')
-                title_suffix = ' (log scale)'
-            else:
-                title_suffix = ''
-            
-            values.plot(kind='bar', ax=ax, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
-            ax.set_title(f'{metric}{title_suffix} - {first_cluster}', fontsize=12, fontweight='bold')
-            ax.set_ylabel(metric, fontsize=11)
-            ax.set_xlabel('Model', fontsize=11)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='x', rotation=45)
+        # Add value labels on top of each bar
+        for i, (model, val) in enumerate(values.items()):
+            if pd.notna(val):
+                # Format value based on metric type
+                if metric == 'R2':
+                    label_text = f'{val:.4f}'
+                elif metric == 'MAPE':
+                    label_text = f'{val:.2f}%'
+                else:
+                    label_text = f'{val:.2f}'
+                
+                ax.text(i, val, label_text, ha='center', va='bottom', 
+                       fontsize=10, fontweight='bold', color='black')
         
-        # Hide unused subplots
-        for idx in range(len(metrics_available), len(axes)):
-            axes[idx].axis('off')
-        
-        fig.suptitle(f'Model Performance Comparison - {first_cluster}', fontsize=14, fontweight='bold', y=1.00)
-        plt.tight_layout()
-        plt.savefig(os.path.join(VIZ_DIR, 'model_comparison_detailed.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-        logger.info("[OK] Enhanced model comparison plot saved")
-        
-        # Summary comparison across all clusters
-        avg_metrics = {}
-        for model in ['SARIMA', 'XGBoost', 'LSTM']:
-            avg_metrics[model] = {}
-            for metric in metrics_available:
-                values = [metrics_results[c].get(model, {}).get(metric, np.nan) 
-                         for c in metrics_results.keys()]
-                avg_metrics[model][metric] = np.nanmean(values)
-        
-        summary_df = pd.DataFrame(avg_metrics).T
-        
-        fig, ax = plt.subplots(figsize=(12, 6))
-        summary_df.plot(kind='bar', ax=ax, width=0.8)
-        ax.set_title('Average Performance Across All Clusters', fontsize=14, fontweight='bold')
-        ax.set_ylabel('Metric Value', fontsize=12)
-        ax.set_xlabel('Model', fontsize=12)
-        ax.legend(title='Metrics', bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.set_title(f'{metric}{title_suffix} - {first_cluster}', fontsize=12, fontweight='bold')
+        ax.set_ylabel(metric, fontsize=11)
+        ax.set_xlabel('Model', fontsize=11)
         ax.grid(True, alpha=0.3, axis='y')
-        ax.tick_params(axis='x', rotation=0)
-        plt.tight_layout()
-        plt.savefig(os.path.join(VIZ_DIR, 'model_comparison_average.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-        logger.info("[OK] Average model comparison plot saved")
+        ax.tick_params(axis='x', rotation=45)
+    
+    # Hide unused subplots
+    for idx in range(len(metrics_available), len(axes)):
+        axes[idx].axis('off')
+    
+    fig.suptitle(f'Model Performance Comparison - {first_cluster}', fontsize=14, fontweight='bold', y=1.00)
+    plt.tight_layout()
+    plt.savefig(os.path.join(VIZ_DIR, 'model_comparison_detailed.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info("[OK] Enhanced model comparison plot saved with value labels")
+    
+    # Summary comparison across all clusters WITH VALUES AND PERFORMANCE GAPS
+    avg_metrics = {}
+    for model in ['SARIMA', 'XGBoost', 'LSTM']:
+        avg_metrics[model] = {}
+        for metric in metrics_available:
+            values = np.array([metrics_results[c].get(model, {}).get(metric, np.nan) 
+                              for c in metrics_results.keys()])
+            avg_metrics[model][metric] = np.nanmean(values)
+    
+    summary_df = pd.DataFrame(avg_metrics).T
+    
+    fig, ax = plt.subplots(figsize=(14, 7))
+    
+    # Create bar plot
+    x = np.arange(len(summary_df.columns))
+    width = 0.25
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+    
+    bars_list = []
+    for i, model in enumerate(summary_df.index):
+        offset = width * (i - 1)
+        bars = ax.bar(x + offset, summary_df.loc[model].values, width, 
+                     label=model, color=colors[i], edgecolor='black', 
+                     linewidth=1.2, alpha=0.85)
+        bars_list.append(bars)
+        
+        # Add value labels on bars
+        for j, (metric_val, bar) in enumerate(zip(summary_df.loc[model].values, bars)):
+            if pd.notna(metric_val):
+                # Format based on metric type
+                if summary_df.columns[j] == 'R2':
+                    label_text = f'{metric_val:.4f}'
+                elif summary_df.columns[j] == 'MAPE':
+                    label_text = f'{metric_val:.1f}%'
+                else:
+                    label_text = f'{metric_val:.2f}'
+                
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width() / 2., height,
+                       label_text, ha='center', va='bottom',
+                       fontsize=9, fontweight='bold', color='black')
+    
+    ax.set_xlabel('Metrics', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Metric Value', fontsize=12, fontweight='bold')
+    ax.set_title('Average Performance Across All Clusters - Model Comparison', 
+                fontsize=14, fontweight='bold', pad=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels(summary_df.columns, fontsize=11)
+    ax.legend(title='Model', title_fontsize=11, fontsize=10, loc='upper left', framealpha=0.95)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(VIZ_DIR, 'model_comparison_average.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info("[OK] Average model comparison plot with concrete values saved")
+    
+    # Generate performance summary table for thesis
+    logger.info("\n" + "="*80)
+    logger.info("MODEL PERFORMANCE SUMMARY (Average Across All Clusters)")
+    logger.info("="*80)
+    print(summary_df.round(4).to_string())
+    logger.info("="*80 + "\n")
+    
+    # Calculate and log performance gaps (improvement percentages)
+    logger.info("PERFORMANCE IMPROVEMENTS vs SARIMA BASELINE")
+    logger.info("-"*80)
+    for model in ['XGBoost', 'LSTM']:
+        logger.info(f"\n{model} vs SARIMA:")
+        for metric in summary_df.columns:
+            sarima_val = summary_df.loc['SARIMA', metric]
+            model_val = summary_df.loc[model, metric]
+            
+            # Calculate improvement (direction depends on metric type)
+            if metric == 'R2':  # Higher is better
+                improvement = ((model_val - sarima_val) / abs(sarima_val)) * 100
+                direction = "better" if improvement > 0 else "worse"
+            else:  # Lower is better for RMSE, MAE, MAPE, Median_AE
+                improvement = ((sarima_val - model_val) / sarima_val) * 100
+                direction = "better" if improvement > 0 else "worse"
+            
+            logger.info(f"  {metric}: {abs(improvement):.2f}% {direction} ({sarima_val:.4f} -> {model_val:.4f})")
+    logger.info("-"*80 + "\n")
     
     # Plot 2: Feature importance (unchanged)
     if xgb_optimizer.feature_importance:
