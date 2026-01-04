@@ -6,6 +6,7 @@ The Instructions to run the final code are as follows:
 pip install -r requirements.txt
 
 2. Main research pipeline to run would be as this:
+- A_00_download_data.ipynb
 - C_00_cleaning_pipeline_with_visualizations.py - Data cleaning & outlier detection
 - C_00_demand_analysis.py - Demand distribution analysis & tier classification
 - C_01_1_hierarchical_clustering.py - Spatiotemporal clustering with K-Means and HDBSCAN
