@@ -2871,7 +2871,7 @@ def create_individual_forecast_plots(
             # ================================================================
             fig, ax = plt.subplots(figsize=(14, 6))
             
-            # First 100 timesteps
+            # First 170 timesteps
             max_steps = min(170, len(actual))
             time_steps = np.arange(max_steps)
             actual_plot = actual[:max_steps]
@@ -3057,7 +3057,7 @@ if metrics_results:
     logger.info("\n" + "="*80)
     logger.info("MODEL PERFORMANCE SUMMARY (Average Across All Clusters)")
     logger.info("="*80)
-    print(summary_df.round(4).to_string())
+    logger.info(summary_df.round(4).to_string())
     logger.info("="*80 + "\n")
     
     # Calculate and log performance gaps (improvement percentages)
